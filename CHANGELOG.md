@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 (2026-11-16)
 
 - **`stepUpWhen`.** Decides whether a switch needs a code, in place of the hat's `sensitive` flag. It gets `from` and `to` (user as worn, and hat), so a site can ask only when the new hat holds a role or permission the current one doesn't. Only an exact `false` skips the code; `true`, a throw or any other answer asks. The `GET /hats` menu's `needsCode` follows the same rule. Without it, nothing changes.
 - **`stepUp.rememberPer: 'set'`.** One good code is remembered for every account in the same linked set, for `rememberMinutes` (default 180). Default `'account'` is unchanged. An account in no set is remembered on its own.

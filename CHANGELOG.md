@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **`stepUpWhen`.** Decides whether a switch needs a code, in place of the hat's `sensitive` flag. It gets `from` and `to` (user as worn, and hat), so a site can ask only when the new hat holds a role or permission the current one doesn't. Only an exact `false` skips the code; `true`, a throw or any other answer asks. The `GET /hats` menu's `needsCode` follows the same rule. Without it, nothing changes.
+- **`stepUp.rememberPer: 'set'`.** One good code is remembered for every account in the same linked set, for `rememberMinutes` (default 180). Default `'account'` is unchanged. An account in no set is remembered on its own.
+- **`stepUp.available` and `stepUp.verify` receive `signedIn` and `set`.** `signedIn` is the account that actually signed in, `set` is the linked set's id or `null`. `user` is still the target. `available` gets them as a second argument. The `switched` event's `steppedUp` still means a code was given in that request. New type export `StepUpContext`.
+
+Tested: 34 tests (30 server, 4 client) against a real Payload and an in-memory MongoDB; the existing tests pass unchanged. New ones cover step down, up and sideways, `stepUpWhen` throwing, rejecting and answering `'yes'`, `1`, `{}` and `undefined`, the menu agreeing with the switch, one code across a linked set inside and after the 3-hour window, an account in no set, and what `available` and `verify` are told. Two mutation checks (set memory off, `stepUpWhen` accepting only `true`) each fail a test.
+Not tested: the React components with the new options (they only read `needsCode`); a real authenticator.
+
 ## 0.1.5 (2026-11-11)
 
 - **`limit` and `blocked` fail closed.** `limit` must answer exactly `true` to allow a link request; any other truthy answer is now refused with `tooMany` (429), as a throw already was. A `blocked` that throws, or answers anything but a reason or `null`, now refuses switching, linking and unlinking with 409 `blocked` and a general reason. Before, a throw escaped as a 500. Tested: 26 tests (22 server, 4 client), 5 mutation checks.

@@ -9,7 +9,7 @@ import { MEMBERS, SESSIONS, type HatsOptions, type HatsUser, type ResolvedHatsOp
 export { hatsStateOf } from './state.js'
 export { applyHat, cleanupSessions, revokeSessions } from './sessions.js'
 export { LINKS, MEMBERS, SESSIONS } from './types.js'
-export type { Hat, HatsEvent, HatsOptions, HatsState, HatsUser } from './types.js'
+export type { Hat, HatsEvent, HatsOptions, HatsState, HatsUser, StepUpContext } from './types.js'
 
 /**
  * Hats for Payload. One person can link up to `maxLinked` accounts and switch between them, and an account that

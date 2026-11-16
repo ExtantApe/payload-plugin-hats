@@ -3,6 +3,14 @@ import type { Payload, PayloadRequest, TypedUser } from 'payload'
 /** One role an account can act in. `sensitive` hats need the second factor before switching into them. */
 export type Hat = { id: string; label: string; sensitive?: boolean }
 
+/** Who is asking, passed to the site's two-step checks along with the target account. */
+export type StepUpContext = {
+  /** The account that actually signed in: the person (`via` when this session was switched in, else the account). */
+  signedIn: HatsUser
+  /** The linked set's id, or null when the target account is in none. */
+  set: string | null
+}
+
 /** A user record as the plugin sees it. */
 export type HatsUser = TypedUser & { id: string | number; email?: string | null; _sid?: string }
 
@@ -37,12 +45,28 @@ export type HatsOptions = {
   /** The site's second factor, asked before switching into a sensitive hat. */
   stepUp?: {
     /** Whether the account has a second factor set up at all. May look it up (async), since it's often a hidden field. */
-    available: (user: HatsUser) => boolean | Promise<boolean>
+    available: (user: HatsUser, ctx: StepUpContext) => boolean | Promise<boolean>
     /** Check a code for `user`. Resolve true only for a good code. */
-    verify: (args: { req: PayloadRequest; user: HatsUser; code: string }) => boolean | Promise<boolean>
-    /** How long a good code is remembered, per account, in minutes. Default 180 (three hours). */
+    verify: (args: { req: PayloadRequest; user: HatsUser; code: string } & StepUpContext) => boolean | Promise<boolean>
+    /** How long a good code is remembered, in minutes. Default 180 (three hours). */
     rememberMinutes?: number
+    /**
+     * What a good code is remembered for. `'account'` (default): the account it was given for. `'set'`: every account
+     * in the same linked set, so one two-step per person; an account in no set is still remembered on its own.
+     */
+    rememberPer?: 'account' | 'set'
   }
+  /**
+   * Decides whether a switch needs a code, in place of the hat's `sensitive` flag. Called with the account and hat
+   * worn now (`from`, as narrowed) and the account and hat it would become (`to`, as it would be worn). Answer `true`
+   * to ask for a code (unless one is remembered). Only an exact `false` skips the code: a throw or any other answer
+   * asks. Default: the target hat's `sensitive` flag.
+   */
+  stepUpWhen?: (args: {
+    req: PayloadRequest
+    from: { user: HatsUser; hat: string | null }
+    to: { user: HatsUser; hat: string }
+  }) => boolean | Promise<boolean>
   /**
    * Who sees the switch. Default: anyone whose own account, or another account in their linked set, has more than
    * one hat. Switching is refused where the switch isn't shown.
@@ -82,8 +106,8 @@ export type HatsEvent =
   | { type: 'switched'; req: PayloadRequest; from: string; to: string; hat: string; via: string; steppedUp: boolean }
   | { type: 'sessions-revoked'; payload: Payload; sessions: number; reason: string }
 
-export type ResolvedHatsOptions = Required<Omit<HatsOptions, 'stepUp' | 'canApproveLinks' | 'blocked' | 'limit' | 'onEvent' | 'confirmURL'>> &
-  Pick<HatsOptions, 'stepUp' | 'canApproveLinks' | 'blocked' | 'limit' | 'onEvent' | 'confirmURL'>
+export type ResolvedHatsOptions = Required<Omit<HatsOptions, 'stepUp' | 'stepUpWhen' | 'canApproveLinks' | 'blocked' | 'limit' | 'onEvent' | 'confirmURL'>> &
+  Pick<HatsOptions, 'stepUp' | 'stepUpWhen' | 'canApproveLinks' | 'blocked' | 'limit' | 'onEvent' | 'confirmURL'>
 
 export const LINKS = 'hat-links'
 export const MEMBERS = 'hat-members'

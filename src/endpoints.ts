@@ -3,6 +3,7 @@ import { addSessionToUser, generateCookie } from 'payload/shared'
 
 import { blockedBy, exactlyTrue } from './access.js'
 import { cleanupSessions, revokeSessions, revokeSid, sessionBySid, sharedLink, tombstone, wornHat } from './sessions.js'
+import { memoryKey, needsStepUp, remembered } from './stepup.js'
 import { asPlugin, hashToken, hatsOptions, hatsStateOf, idOf, newToken } from './state.js'
 import { LINKS, MEMBERS, SESSIONS, type Hat, type HatsUser, type ResolvedHatsOptions } from './types.js'
 
@@ -58,11 +59,6 @@ async function linkedAccounts(req: PayloadRequest, userId: string) {
 
 const defaultShow: NonNullable<ResolvedHatsOptions['showSwitch']> = ({ hats, linked }) => hats.length > 1 || linked.some((l) => l.hats.length > 1)
 
-const remembered = (opts: ResolvedHatsOptions, steppedUp: Record<string, string> | null | undefined, account: string) => {
-  const at = steppedUp?.[account]
-  return Boolean(at && Date.now() - new Date(at).getTime() < (opts.stepUp?.rememberMinutes ?? 180) * 60_000)
-}
-
 async function blockedReason(req: PayloadRequest, opts: ResolvedHatsOptions) {
   if (!opts.blocked) return
   const why = await blockedBy(() => opts.blocked!(req))
@@ -81,6 +77,10 @@ const me: Endpoint = {
     const worn = wornHat(hats, state.hat ? { hat: state.hat, via: state.via } : null) ?? hats.at(-1) ?? null
     const s = await sessionBySid(req.payload, state.sid, req)
     const mine = await membershipOf(req, String(full.id))
+    const from = { user: req.user as HatsUser, hat: worn?.id ?? null }
+    const setId = mine?.status === 'approved' ? idOf(mine.link) : null
+    const asks = async (target: HatsUser, targetHats: Hat[], h: Hat, sameAccount: boolean) =>
+      !(sameAccount && h.id === worn?.id) && (await needsStepUp(opts, { req, from, target, hats: targetHats, hat: h })) && !remembered(opts, s?.steppedUp, String(target.id), setId)
     // The set as this account may see it: an account nobody has confirmed yet stays hidden, so a request never
     // reveals whether an email has an account here.
     const set: { id: string | number; label: string; status: string; you: boolean }[] = []
@@ -96,12 +96,14 @@ const me: Endpoint = {
       account: { id: full.id, label: labelOf(full) },
       signedInAs: person,
       hat: worn?.id ?? null,
-      hats: hats.map((h) => ({ ...h, needsCode: Boolean(h.sensitive && h.id !== worn?.id && !remembered(opts, s?.steppedUp, String(full.id))) })),
-      linked: linked.map((l) => ({
-        id: l.user.id,
-        label: labelOf(l.user),
-        hats: l.hats.map((h) => ({ ...h, needsCode: Boolean(h.sensitive && !remembered(opts, s?.steppedUp, String(l.user.id))) })),
-      })),
+      hats: await Promise.all(hats.map(async (h) => ({ ...h, needsCode: await asks(full, hats, h, true) }))),
+      linked: await Promise.all(
+        linked.map(async (l) => ({
+          id: l.user.id,
+          label: labelOf(l.user),
+          hats: await Promise.all(l.hats.map(async (h) => ({ ...h, needsCode: await asks(l.user, l.hats, h, false) }))),
+        })),
+      ),
       link,
       set,
       canLink: Boolean(opts.canApproveLinks),
@@ -144,15 +146,18 @@ const switchHat: Endpoint = {
     const nowWearing = to === current ? (wornHat(hats, s) ?? hats.at(-1))!.id : null
     const steppedUp = { ...(s?.steppedUp ?? {}) }
     let gaveCode = false
-    if (hat!.sensitive && hat!.id !== nowWearing && !remembered(opts, steppedUp, to)) {
+    const setId = (await membershipOf(req, to).then((m) => (m?.status === 'approved' ? idOf(m.link) : null))) ?? null
+    const from = { user: req.user as HatsUser, hat: wornHat(opts.hatsOf(full), s)?.id ?? opts.hatsOf(full).at(-1)?.id ?? null }
+    if (hat!.id !== nowWearing && (await needsStepUp(opts, { req, from, target: target!, hats, hat: hat! })) && !remembered(opts, steppedUp, to, setId)) {
       if (!opts.stepUp) refuse('This site has no second factor for switching up.', 403, 'noSecondFactor')
       // Only an exact `true` passes either check; a truthy answer such as `{ valid: false }`, or a thrown error, is a no.
       const stepUp = opts.stepUp!
-      if (!(await exactlyTrue(() => stepUp.available(target!)))) refuse('Set up two-step sign-in on that account first.', 403, 'setUpTwoStep')
+      const ctx = { signedIn: (person === current ? full : await loadUser(req, person)) ?? full, set: setId }
+      if (!(await exactlyTrue(() => stepUp.available(target!, ctx)))) refuse('Set up two-step sign-in on that account first.', 403, 'setUpTwoStep')
       const code = typeof body.code === 'string' ? body.code.trim() : ''
       if (!code) return json({ ok: false, needsCode: true, reason: 'needsCode', message: 'Enter a code from that account’s authenticator app.' }, 401)
-      if (!(await exactlyTrue(() => stepUp.verify({ req, user: target!, code })))) refuse('That code didn’t work. Try a new one.', 403, 'wrongCode')
-      steppedUp[to] = new Date().toISOString()
+      if (!(await exactlyTrue(() => stepUp.verify({ req, user: target!, code, ...ctx })))) refuse('That code didn’t work. Try a new one.', 403, 'wrongCode')
+      steppedUp[memoryKey(opts, to, setId)] = new Date().toISOString()
       gaveCode = true
     }
 

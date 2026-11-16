@@ -596,3 +596,192 @@ describe('only an exact true from the site’s checks', () => {
     expect((await whoIs(token))!.level).toBe('author')
   })
 })
+
+describe('stepUpWhen and remembering per set', () => {
+  /** Permissions that don't nest, so a hat can sit beside another: curator and author each hold something the other lacks. */
+  const PERMS: Record<string, string[]> = { member: ['read'], author: ['read', 'write'], curator: ['read', 'curate'], admin: ['read', 'write', 'curate', 'admin'] }
+  const gains = ({ from, to }: { from: { hat: string | null }; to: { hat: string } }) => PERMS[to.hat]!.some((p) => !PERMS[from.hat ?? 'admin']!.includes(p))
+  const live = () => payload.config.custom!.hats as ResolvedHatsOptions & { stepUpWhen?: unknown }
+  async function using(patch: Record<string, unknown>, fn: () => Promise<void>) {
+    const opts = live() as unknown as Record<string, any>
+    const before = { stepUpWhen: opts.stepUpWhen, stepUp: opts.stepUp }
+    if ('stepUpWhen' in patch) opts.stepUpWhen = patch.stepUpWhen
+    if ('rememberPer' in patch) opts.stepUp = { ...opts.stepUp, rememberPer: patch.rememberPer }
+    try {
+      await fn()
+    } finally {
+      opts.stepUpWhen = before.stepUpWhen
+      opts.stepUp = before.stepUp
+    }
+  }
+  const menuAsks = async (token: string) => Object.fromEntries((await call('/hats', token, undefined, 'get')).body.hats.map((h: Hat & { needsCode: boolean }) => [h.id, h.needsCode]))
+
+  it('asks nothing for a step down, and for a step up or sideways, with the menu saying the same', async () => {
+    await using({ stepUpWhen: gains }, async () => {
+      const admin = await make(email('admin'), 'admin', { code: '111111' })
+      const token = await login(admin.email!)
+      // Plain sign-in wears everything: every move is down.
+      expect(Object.values(await menuAsks(token)).filter(Boolean)).toEqual([])
+      expect((await call('/hats/switch', token, { hat: 'curator' })).status).toBe(200)
+      // Sideways: author is not sensitive, but it holds write, which curator lacks.
+      expect((await menuAsks(token)).author).toBe(true)
+      expect((await menuAsks(token)).member).toBe(false)
+      expect((await call('/hats/switch', token, { hat: 'author' })).status).toBe(401)
+      expect((await whoIs(token))!.level).toBe('curator')
+      expect((await call('/hats/switch', token, { hat: 'member' })).status).toBe(200) // down
+      expect((await menuAsks(token)).author).toBe(true)
+      const up = await call('/hats/switch', token, { hat: 'author' }) // up
+      expect(up.status).toBe(401)
+      expect(up.body.needsCode).toBe(true)
+      expect((await call('/hats/switch', token, { hat: 'author', code: '111111' })).status).toBe(200)
+      expect((await menuAsks(token)).admin).toBe(false) // a code was just given: remembered
+    })
+  })
+
+  it('hands stepUpWhen the user as worn now and as it would be worn', async () => {
+    const seen: { from: unknown; to: unknown }[] = []
+    await using({ stepUpWhen: ({ from, to }: any) => (seen.push({ from: { level: from.user.level, hat: from.hat }, to: { level: to.user.level, hat: to.hat } }), false) }, async () => {
+      const admin = await make(email('admin'), 'admin')
+      const token = await login(admin.email!)
+      await call('/hats/switch', token, { hat: 'author' })
+      await call('/hats/switch', token, { hat: 'curator' })
+    })
+    expect(seen).toEqual([
+      { from: { level: 'admin', hat: 'admin' }, to: { level: 'author', hat: 'author' } },
+      { from: { level: 'author', hat: 'author' }, to: { level: 'curator', hat: 'curator' } },
+    ])
+  })
+
+  it('asks for a code when stepUpWhen throws, rejects, or answers anything but false', async () => {
+    const answersToTry: [string, () => unknown][] = [...NOT_TRUE, ['true', () => true], ['undefined', () => undefined]]
+    for (const [what, answer] of answersToTry) {
+      await using({ stepUpWhen: answer }, async () => {
+        const admin = await make(email('admin'), 'admin', { code: '222222' })
+        const token = await login(admin.email!)
+        const res = await call('/hats/switch', token, { hat: 'member' }) // a plain step down
+        expect(res.status, what).toBe(401)
+        expect(res.body.needsCode, what).toBe(true)
+        expect((await menuAsks(token)).member, what).toBe(true)
+        expect((await whoIs(token))!.level, what).toBe('admin')
+        expect((await call('/hats/switch', token, { hat: 'member', code: '222222' })).status, what).toBe(200)
+      })
+    }
+    // Only an exact false lets it through.
+    await using({ stepUpWhen: () => false }, async () => {
+      const admin = await make(email('admin'), 'admin')
+      expect((await call('/hats/switch', await login(admin.email!), { hat: 'member' })).status).toBe(200)
+    })
+  })
+
+  it('still refuses when stepUpWhen asks and the site has no second factor on that account', async () => {
+    await using({ stepUpWhen: () => true }, async () => {
+      const author = await make(email('author'), 'author')
+      const token = await login(author.email!)
+      const res = await call('/hats/switch', token, { hat: 'member' })
+      expect(res.status).toBe(403)
+      expect(res.body.data?.reason).toBe('setUpTwoStep')
+    })
+  })
+
+  async function pair() {
+    const approver = await make(email('maint'), 'admin', { maintainer: true })
+    const a = await make(email('a'), 'admin', { code: '333333' })
+    const b = await make(email('b'), 'admin', { code: '444444' })
+    await link(a, b, approver)
+    const [mine] = (await payload.find({ collection: MEMBERS as never, where: { user: { equals: a.id } }, overrideAccess: true })).docs as unknown as { link: unknown }[]
+    const setId = String(typeof mine!.link === 'object' ? (mine!.link as { id: unknown }).id : mine!.link)
+    return { a, b, setId }
+  }
+  const ageMemory = async (token: string, key: string) => {
+    const { docs } = await payload.find({ collection: SESSIONS as never, where: { sid: { equals: hatsStateOf(await whoIs(token))!.sid } }, overrideAccess: true })
+    const old = new Date(Date.now() - 181 * 60_000).toISOString()
+    await payload.update({ collection: SESSIONS as never, id: docs[0]!.id, data: { steppedUp: { [key]: old } } as never, overrideAccess: true })
+  }
+
+  it('by default a code covers its own account only', async () => {
+    const { a, b } = await pair()
+    const token = await login(a.email!)
+    await call('/hats/switch', token, { hat: 'member' })
+    expect((await call('/hats/switch', token, { hat: 'admin', code: '333333' })).status).toBe(200)
+    expect((await call('/hats/switch', token, { account: b.id, hat: 'admin' })).status).toBe(401)
+  })
+
+  it('with rememberPer set, one code covers every linked account for three hours, then asks again', async () => {
+    const { a, b, setId } = await pair()
+    await using({ rememberPer: 'set' }, async () => {
+      const token = await login(a.email!)
+      await call('/hats/switch', token, { hat: 'member' })
+      expect((await call('/hats/switch', token, { hat: 'admin', code: '333333' })).status).toBe(200)
+      // Into b, whose own code was never given.
+      const into = await call('/hats/switch', token, { account: b.id, hat: 'admin' })
+      expect(into.status).toBe(200)
+      expect((await whoIs(into.token!))!.id).toBe(b.id)
+      // And back to a's admin hat from b's session.
+      const t = into.token!
+      await call('/hats/switch', t, { hat: 'member' })
+      const menu = await call('/hats', t, undefined, 'get')
+      expect(menu.body.hats.find((h: Hat & { needsCode: boolean }) => h.id === 'admin').needsCode).toBe(false)
+      expect(menu.body.linked[0].hats.find((h: Hat & { needsCode: boolean }) => h.id === 'admin').needsCode).toBe(false)
+      expect((await call('/hats/switch', t, { account: a.id, hat: 'admin' })).status).toBe(200)
+
+      // Three hours on: asked again, and a good code (this time b's) is remembered for the set again.
+      const t2 = await login(b.email!)
+      await call('/hats/switch', t2, { hat: 'member' })
+      await ageMemory(t2, `set:${setId}`)
+      const again = await call('/hats/switch', t2, { hat: 'admin' })
+      expect(again.status).toBe(401)
+      expect((await call('/hats/switch', t2, { hat: 'admin', code: '444444' })).status).toBe(200)
+    })
+  })
+
+  it('an account in no set is remembered on its own, and verify and available are told who signed in and which set', async () => {
+    const { a, b, setId } = await pair()
+    const lone = await make(email('lone'), 'admin', { code: '555555' })
+    const told: { fn: string; user: unknown; signedIn: unknown; set: unknown }[] = []
+    const opts = live() as unknown as { stepUp: { available: (...a: any[]) => unknown; verify: (...a: any[]) => unknown; rememberPer?: string } }
+    const before = { ...opts.stepUp }
+    opts.stepUp = {
+      ...before,
+      rememberPer: 'set',
+      available: (u: HatsUser, ctx: any) => (told.push({ fn: 'available', user: u.id, signedIn: ctx.signedIn.id, set: ctx.set }), before.available(u, ctx)),
+      verify: (args: any) => (told.push({ fn: 'verify', user: args.user.id, signedIn: args.signedIn.id, set: args.set }), before.verify(args)),
+    }
+    try {
+      const lt = await login(lone.email!)
+      await call('/hats/switch', lt, { hat: 'member' })
+      expect((await call('/hats/switch', lt, { hat: 'admin', code: '555555' })).status).toBe(200)
+      const { docs } = await payload.find({ collection: SESSIONS as never, where: { sid: { equals: hatsStateOf(await whoIs(lt))!.sid } }, overrideAccess: true })
+      expect(Object.keys((docs[0] as unknown as { steppedUp: object }).steppedUp)).toEqual([String(lone.id)])
+      expect(told.at(-1)).toEqual({ fn: 'verify', user: lone.id, signedIn: lone.id, set: null })
+
+      // The person is a; the target is b: the target stays `user`.
+      told.length = 0
+      const at = await login(a.email!)
+      await call('/hats/switch', at, { hat: 'member' })
+      const into = await call('/hats/switch', at, { account: b.id, hat: 'admin', code: '444444' })
+      expect(into.status).toBe(200)
+      expect(told.at(-1)).toEqual({ fn: 'verify', user: b.id, signedIn: a.id, set: setId })
+      expect(told[0]).toEqual({ fn: 'available', user: b.id, signedIn: a.id, set: setId })
+      // From b's session the person is still a.
+      told.length = 0
+      await call('/hats/switch', into.token!, { hat: 'member' })
+      await ageMemory(into.token!, `set:${setId}`)
+      await call('/hats/switch', into.token!, { hat: 'admin', code: '444444' })
+      expect(told.at(-1)).toMatchObject({ fn: 'verify', user: b.id, signedIn: a.id, set: setId })
+    } finally {
+      opts.stepUp = before
+    }
+  })
+
+  it('reports steppedUp on the event only when a code was given in that request', async () => {
+    events.length = 0
+    const { a } = await pair()
+    const token = await login(a.email!)
+    await call('/hats/switch', token, { hat: 'member' })
+    await call('/hats/switch', token, { hat: 'admin', code: '333333' })
+    await call('/hats/switch', token, { hat: 'member' })
+    await call('/hats/switch', token, { hat: 'admin' }) // remembered
+    const sw = events.filter((e) => e.type === 'switched') as Extract<HatsEvent, { type: 'switched' }>[]
+    expect(sw.map((e) => e.steppedUp)).toEqual([false, true, false, false])
+  })
+})

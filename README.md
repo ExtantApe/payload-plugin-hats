@@ -2,7 +2,7 @@
 
 Linked accounts and role hats for Payload. One person links their accounts and switches between them, and an account with several roles acts in one at a time. Switching up into a sensitive role asks for a second factor.
 
-**Status:** early, 0.x. The server side passes 30 tests against a real Payload 3.92 and MongoDB, with made-up roles and a fake second factor. The two React components were tried in a browser on a local copy of a real site (2026-11-09) with made-up accounts: keyboard, a real authenticator code, the approval form, and axe with 0 findings on the switch, the code prompt and the linking section in light and dark. It isn't in use on any site yet.
+**Status:** early, 0.x. The server side passes 30 tests against a real Payload 3.92 and MongoDB, with made-up roles and a fake second factor. The redesigned switch (unreleased) has unit tests for its order, gating, button markup, code screen and focus targets, and was run in a browser at 390 and 1280 px wide on a local copy of a site with made-up accounts: keyboard open, Escape, the focus trap, Cancel back to the hat, a one-tap switch and the note after it (that browser run was before the button and note changes below, and wasn't repeated). A real authenticator code wasn't tried with the new switch; the server refused the made-up code, as it should. It isn't in use on any site yet.
 
 ## What it does
 
@@ -62,7 +62,21 @@ Endpoints, under the API route:
 
 Approvers approve in the admin, under Accounts → Linked accounts.
 
-The switch goes in the admin header (turn it off with `adminSwitch: false`). For a site's own pages, `@extantape/payload-plugin-hats/client` has `HatSwitcher` for the header and `LinkedAccounts` for the account page. They need no Payload UI package. By default they take the surrounding text color, and they follow `--hats-ink`, `--hats-paper`, `--hats-line`, `--hats-muted` and `--hats-focus` if you set them.
+The switch goes in the admin header (turn it off with `adminSwitch: false`). The plugin doesn't pass options such as `accountTitle` or `hatHelp` to the header switch, so a site that needs them sets `adminSwitch: false` and registers its own wrapper around `HatSwitcher`. For a site's own pages, `@extantape/payload-plugin-hats/client` has `HatSwitcher` for the header, `HatsSwitchedNote` for pages without a switch, and `LinkedAccounts` for the account page. They need no Payload UI package.
+
+**The switch.** A pill, "Acting as Author" (24 characters at most, never the email), opens a panel titled Switch role: a popover 360 px wide under the trigger, or a bottom sheet below 640 px (85% of the screen at most, scrolling inside, with a scrim and room for the phone's safe area). It shows the hat worn now, then one group per account, the current account first. Each group is a fieldset with a button per hat: safe hats first, then hats that ask for a code, tagged with a lock and Needs a code. The hat worn now is marked Current and does nothing. A safe hat switches in one tap (the hat worn is marked with `aria-current`, so a screen reader says which one it is). A hat that asks for a code opens a code screen, Confirm it's you, with Switch and Cancel; Cancel puts focus back on that hat. Escape on the code screen goes back to the list too, and keeps what was typed. Spaces and dashes in a pasted code are dropped. When the hat worn is above the narrowest one, a Back to Member row stays at the bottom. Escape, the close button and the scrim close it and return focus to the trigger; focus stays inside while it's open.
+
+After a switch the page reloads (or your `onSwitched` runs) and a note says "Now acting as Curator. Switch back to Member." in a status region with a dismiss button. A note with a Switch back link stays until it's dismissed, and focus stays where it was. A note without one goes after 5 seconds (longer while hovered or focused), and focus moves to the new page's heading. It's kept in sessionStorage across the reload.
+
+Site options on `HatSwitcher`, all optional:
+
+- `accountTitle(account)`: each group's heading, for example its job ("Maintainer account"). Default: This account, Linked account. The email sits under it, small.
+- `hatHelp`: a helper line under each hat, as `{ [hatId]: line }` or `(hat, account) => line`.
+- `orderHats(hats)`: the order inside a group. Default: as `hatsOf` gives them, with hats that ask for a code last.
+- `anotherWay`: text shown under Use another way on the code screen (recovery codes, say). Left out, the link isn't shown.
+- `noteMs`: how long the note stays. Default 5000.
+
+Colors and sizes come from `--hats-ink`, `--hats-paper`, `--hats-line`, `--hats-muted`, `--hats-hover`, `--hats-selected`, `--hats-error`, `--hats-focus` (an outline value), `--hats-row` and the rest in `src/client/styles.ts`. Unset, they follow the Payload admin's theme variables, so the switch matches the admin in light and dark, and then the surrounding text. There are no fixed colors.
 
 Every word is replaceable for translation: pass `text` (see `defaultText`). Server answers carry a stable `reason` (for example `wrongCode`), and `text.reasons` gives your words for each; anything you leave out shows the English.
 

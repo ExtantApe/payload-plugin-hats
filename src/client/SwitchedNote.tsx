@@ -11,14 +11,14 @@ export type HatsSwitchedNoteProps = {
   text?: Partial<HatsText>
   /** Called after "Switch back" works, instead of reloading the page. */
   onSwitched?: () => void
-  /** How long the note stays, in milliseconds. Default 5000; it waits while hovered or focused. */
+  /** How long a note with no way back stays, in milliseconds. Default 5000; it waits while hovered or focused. */
   noteMs?: number
 }
 
 /**
- * The note after a switch: "Now acting as Curator. Switch back to Member." in a status region, for 5 seconds (longer
- * while it's hovered or focused), with a dismiss button. The switch saves it in this tab's sessionStorage before the
- * page reloads or moves on; whichever page loads next shows it once and moves focus to that page's heading.
+ * The note after a switch: "Now acting as Curator. Switch back to Member." in a status region, with a dismiss button. A note with
+ * a way back stays until dismissed; one without goes after `noteMs` (5 seconds), longer while hovered or focused. The switch saves it in this tab's sessionStorage before the
+ * page reloads or moves on; whichever page loads next shows it once, and moves focus to that page's heading when the note has no way back.
  * `HatSwitcher` includes it. Put it on pages that have no switch (a site's own pages, say), so the note follows a
  * switch that lands there.
  */
@@ -40,7 +40,7 @@ export function HatsSwitchedNote({ apiRoute = '/api', text, onSwitched, noteMs =
     // The page heading; on a page without an h1, the main region or the first content heading (Payload's dashboard).
     // Tried a few times, since the admin draws its heading after hydrating.
     let tries = 0
-    let heading: ReturnType<typeof setTimeout>
+    let heading: ReturnType<typeof setTimeout> | undefined
     const toHeading = () => {
       const h =
         document.querySelector<HTMLElement>('main h1, h1') ??
@@ -60,12 +60,15 @@ export function HatsSwitchedNote({ apiRoute = '/api', text, onSwitched, noteMs =
       }
       h.focus({ preventScroll: true })
     }
-    heading = setTimeout(toHeading, 300)
+    // A note with a way back keeps focus where it is: it stays until dismissed, and moving focus would cut off
+    // the announcement and take a keyboard user away from the quickest undo.
+    if (!found.back) heading = setTimeout(toHeading, 300)
     return () => (clearTimeout(shown), clearTimeout(heading))
   }, [])
 
   useEffect(() => {
-    if (!note || held || noteError) return
+    // A note with a way back stays until it's dismissed (WCAG 2.2.1). One without goes after `noteMs`.
+    if (!note || note.back || held || noteError) return
     const id = setTimeout(() => setNote(null), noteMs)
     return () => clearTimeout(id)
   }, [note, held, noteError, noteMs])

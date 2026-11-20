@@ -9,6 +9,8 @@ export const tokens = {
   ink: v('ink', 'var(--theme-text, currentColor)'),
   paper: v('paper', 'var(--theme-elevation-0, Canvas)'),
   line: v('line', 'var(--theme-elevation-150, color-mix(in srgb, currentColor 30%, transparent))'),
+  // Field borders need 3:1 (WCAG 1.4.11), which elevation 150 doesn't give.
+  field: v('field', 'var(--theme-elevation-600, color-mix(in srgb, currentColor 60%, transparent))'),
   // Payload's elevation 650 keeps 4.5:1 on its own backgrounds in light and dark.
   muted: v('muted', 'var(--theme-elevation-650, color-mix(in srgb, currentColor 78%, transparent))'),
   hover: v('hover', 'var(--theme-elevation-50, color-mix(in srgb, currentColor 6%, transparent))'),
@@ -57,10 +59,10 @@ export const css = `
 .hats-sw-acct{display:block;font-weight:600}
 .hats-sw-email{display:block;font-size:${t.small};color:${t.muted};text-decoration:none;font-weight:400}
 .hats-sw-rows{display:flex;flex-direction:column;gap:${t.gap};clear:both}
-.hats-sw-row{display:flex;align-items:center;gap:12px;min-height:${t.row};padding:6px 10px;border-radius:${t.radiusSmall};cursor:pointer}
+.hats-sw-row{font:inherit;color:inherit;text-align:start;background:transparent;border:0;width:100%;display:flex;align-items:center;gap:12px;min-height:${t.row};padding:6px 10px;border-radius:${t.radiusSmall};cursor:pointer}
 .hats-sw-row:hover{background:${t.hover}}
 .hats-sw-row[data-current="true"]{background:${t.selected}}
-.hats-sw-row input{margin:0;width:18px;height:18px;flex:none;accent-color:${t.ink}}
+.hats-sw-row[aria-disabled="true"]{cursor:progress}
 .hats-sw-row-text{flex:1 1 auto;min-width:0}
 .hats-sw-row-name{display:block}
 .hats-sw-row[data-current="true"] .hats-sw-row-name{font-weight:600}
@@ -76,7 +78,7 @@ export const css = `
 .hats-sw-code p{margin:0 0 12px}
 .hats-sw-code .hats-sw-more{margin-top:${t.gap}}
 .hats-sw-code label{display:block;font-weight:600;margin-bottom:4px}
-.hats-sw-input{font:inherit;font-size:1.25rem;letter-spacing:.15em;color:${t.ink};background:${t.paper};border:1px solid ${t.line};border-radius:${t.radiusSmall};min-height:${t.row};padding:6px 12px;width:100%;max-width:14em}
+.hats-sw-input{font:inherit;font-size:1.25rem;letter-spacing:.15em;color:${t.ink};background:${t.paper};border:1px solid ${t.field};border-radius:${t.radiusSmall};min-height:${t.row};padding:6px 12px;width:100%;max-width:14em}
 .hats-sw-input[aria-invalid="true"]{border-color:${t.error};border-width:2px}
 .hats-sw-actions{display:flex;flex-wrap:wrap;gap:${t.gap};margin-top:${t.space}}
 .hats-sw-error{color:${t.error};font-size:${t.small};margin:6px 0 0}

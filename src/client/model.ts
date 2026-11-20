@@ -104,6 +104,12 @@ export function focusAfter(action: 'cancel-code' | 'close' | 'open-code', ids: {
   return ids.trigger
 }
 
+/**
+ * A typed or pasted code, ready to send: spaces removed, and dashes too for the numeric code ("123 456" and
+ * "123-456" both become "123456"). Recovery codes (`otherWay`) keep their dashes. Not capped; the server decides.
+ */
+export const cleanCode = (raw: string, otherWay = false) => raw.replace(otherWay ? /\s+/g : /[\s-]+/g, '')
+
 /** The note kept across the reload after a switch, read once by the next page. */
 export type SwitchedNote = { hat: string; back: { id: string; label: string } | null; at: number }
 export const NOTE_KEY = 'hats:switched'

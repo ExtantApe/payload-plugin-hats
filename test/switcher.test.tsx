@@ -1,10 +1,12 @@
+import { readFileSync } from 'node:fs'
+
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 
 import { defaultText, type MenuHat } from '../src/client/api.js'
 import { SwitcherView, type SwitcherViewProps } from '../src/client/HatSwitcher.js'
 import { HatsSwitchedNote } from '../src/client/SwitchedNote.js'
-import { actionFor, backHat, clip, currentHatOf, defaultOrder, dropNote, focusAfter, groupsOf, helpLine, NOTE_KEY, radioId, saveNote, takeNote, type SignedInMenu } from '../src/client/model.js'
+import { actionFor, backHat, cleanCode, clip, currentHatOf, defaultOrder, dropNote, focusAfter, groupsOf, helpLine, NOTE_KEY, radioId, saveNote, takeNote, type SignedInMenu } from '../src/client/model.js'
 import { css } from '../src/client/styles.js'
 
 const hat = (id: string, label: string, needsCode = false, sensitive = needsCode): MenuHat => ({ id, label, needsCode, sensitive })
@@ -40,7 +42,6 @@ const view = (over: Partial<SwitcherViewProps> = {}) => {
       groups={groups}
       current={currentHatOf(m)}
       back={backHat(m)}
-      selected=""
       busy={null}
       error=""
       asking={null}
@@ -149,24 +150,32 @@ describe('radio semantics', () => {
     expect(html.indexOf('Keeper account')).toBeLessThan(html.indexOf('Staff account'))
   })
 
-  it('gives each hat a native radio with a label, one name per account, helper lines tied by aria-describedby', () => {
+  it('gives each hat a button, one fieldset per account, and no radios', () => {
     const { html, doc } = view()
-    expect(doc.count(/type="radio"/g)).toBe(6)
-    expect(doc.count(/name="hx-acct-a1"/g)).toBe(4)
-    expect(doc.count(/name="hx-acct-b2"/g)).toBe(2)
-    const rid = radioId('hx', undefined, 'member')
-    expect(html).toContain(`<label class="hats-sw-row" for="${rid}">`)
-    expect(html).toContain(`aria-describedby="${rid}-help"`)
-    expect(html).toContain(`id="${rid}-help" class="hats-sw-help">Browse and keep animals.`)
+    expect(doc.count(/type="radio"/g)).toBe(0)
+    expect(doc.count(/<button type="button" id="hx-r-/g)).toBe(6)
+    expect(html).not.toContain('role="radio"')
+    expect(html).not.toContain('checked')
   })
 
-  it('keeps the current hat focusable and marks it with the word Current', () => {
+  it('marks only the hat worn with aria-current', () => {
     const { html } = view()
-    expect(html).not.toMatch(/disabled/)
-    expect(html).toMatch(/data-current="true"[^>]*for="hx-r-self-author"/)
-    // "Current" twice: the top block and the row. No check mark stands in for it.
-    expect(html.match(/>Current</g)).toHaveLength(2)
-    expect(html).not.toContain('✓')
+    expect(html.match(/aria-current="true"/g)).toHaveLength(1)
+    expect(html).toMatch(/id="hx-r-self-author" class="hats-sw-row" data-current="true" aria-current="true"/)
+    expect(view({ menu: menu({ hat: 'curator' }) }).html).toMatch(/id="hx-r-self-curator"[^>]*aria-current="true"/)
+  })
+
+  it('reads the helper line once: inside its button, never again through aria-describedby', () => {
+    const { html } = view()
+    // Once per button (Member is on both accounts), and never in a second place.
+    expect(html.match(/Browse and keep animals\./g)).toHaveLength(2)
+    expect(html).not.toMatch(/id="[^"]*-help"/)
+    expect(html).not.toMatch(/hats-sw-row[^>]*aria-describedby/)
+  })
+
+  it('has a status line that says Switching… only while busy', () => {
+    expect(view().html).toContain('<p class="hats-sw-vh" role="status"></p>')
+    expect(view({ busy: radioId('hx', 'b2', 'member') }).html).toContain('role="status">Switching…</p>')
   })
 
   it('tags each hat that asks for a code with a lock and the words, never on the current hat', () => {
@@ -177,7 +186,7 @@ describe('radio semantics', () => {
 
   it('orders inside a group: Member, Author, then sensitive hats', () => {
     const { html } = view()
-    const at = (id: string) => html.indexOf(`value="${id}"`)
+    const at = (id: string) => html.indexOf(`id="hx-r-self-${id}"`)
     expect(at('member')).toBeLessThan(at('author'))
     expect(at('author')).toBeLessThan(at('curator'))
     expect(at('curator')).toBeLessThan(at('all'))
@@ -215,6 +224,8 @@ describe('the code screen', () => {
     expect(html).toContain('>Switch to Administrator<')
     expect(html).toContain('>Cancel<')
     expect(html).toContain('autoComplete="one-time-code"')
+    // No length cap, so a pasted "123 456" isn't cut short.
+    expect(html).not.toContain('maxLength')
     expect(html).not.toContain('Use another way')
   })
 
@@ -236,6 +247,17 @@ describe('the code screen', () => {
 
   it('says this account in its own words when the site gives no title', () => {
     expect(defaultText.confirmBody('Curator', 'This account')).toMatch(/as Curator on this account\.$/)
+  })
+})
+
+describe('pasted codes', () => {
+  it('drops spaces and dashes and keeps every digit', () => {
+    expect(cleanCode('123 456')).toBe('123456')
+    expect(cleanCode(' 123-456 ')).toBe('123456')
+    expect(cleanCode('123\u00a0456')).toBe('123456')
+  })
+  it('keeps dashes in a recovery code', () => {
+    expect(cleanCode('AB12 CD34-EF56', true)).toBe('AB12CD34-EF56')
   })
 })
 
@@ -286,6 +308,28 @@ describe('the note after a switch', () => {
     const broken = { getItem: () => { throw new Error('blocked') }, setItem: () => { throw new Error('full') }, removeItem: () => undefined }
     expect(() => saveNote(broken, { hat: 'x', back: null })).not.toThrow()
     expect(takeNote(broken)).toBeNull()
+  })
+})
+
+describe('the note and the scrim', () => {
+  const src = (f: string) => readFileSync(new URL(`../src/client/${f}`, import.meta.url), 'utf8')
+  it('keeps a note with a way back until it is dismissed, and leaves focus alone', () => {
+    const note = src('SwitchedNote.tsx')
+    expect(note).toContain('if (!note || note.back || held || noteError) return')
+    expect(note).toContain('if (!found.back) heading = setTimeout(toHeading, 300)')
+  })
+  it('closes the scrim on click, not pointerdown', () => {
+    const sw = src('HatSwitcher.tsx')
+    expect(sw).toMatch(/hats-sw-scrim"[\s\S]{0,80}onClick=/)
+    expect(sw).not.toContain("classList.contains('hats-sw-scrim')")
+  })
+  it('lands focus inside the panel when no hat is current, and Escape on the code screen steps back', () => {
+    const sw = src('HatSwitcher.tsx')
+    expect(sw).toContain('currentRadio || firstRow || `${base}-close`')
+    expect(sw).toMatch(/if \(asking\) \{[^}]*draft\.current = \{ key: rid, code \}/)
+  })
+  it('gives the code field a border token of its own, not the faint line', () => {
+    expect(css).toMatch(/\.hats-sw-input\{[^}]*border:1px solid var\(--hats-field, var\(--theme-elevation-600/)
   })
 })
 

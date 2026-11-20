@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 (2026-11-20)
 
 - **A new hat switch.** A pill trigger ("Acting as Author"), a 360 px popover on wide screens and a bottom sheet under 640 px. It shows the hat worn now, then one fieldset per account (current account first) with a button per hat (`aria-current` on the one worn): safe hats first, then hats that ask for a code, tagged with a lock and Needs a code. Safe hats switch in one tap; the others open a code screen (Confirm it's you, Switch to <hat>, Cancel, and an optional Use another way). A Back to Member row stays at the bottom above the narrowest hat. Escape, close and the scrim return focus to the trigger, Cancel returns it to the hat, and focus stays in the panel while it's open.
 - **A note after each switch.** "Now acting as <hat>. Switch back to <narrowest hat>." in a status region, kept in sessionStorage across the reload. A note with a Switch back link stays until it's dismissed and focus stays put; one without goes after 5 seconds (longer while hovered or focused), with focus moved to the new page's heading. `HatsSwitchedNote` shows it on pages without a switch.

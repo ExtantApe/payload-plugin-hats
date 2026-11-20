@@ -53,9 +53,29 @@ export const statusText = (status: string, you: boolean) =>
 
 /** Every word the components show, so a site can pass its own translations. English by default. */
 export const defaultText = {
-  switchHint: 'switch account or role',
+  /** Visually hidden after the trigger's words. */
+  switchHint: 'Switch account or role.',
   switchGroup: 'Switch account or role',
-  switchFallback: 'Switch',
+  switchFallback: 'Switch role',
+  /** The trigger's words; cut to 24 characters. */
+  trigger: (hat: string) => `Acting as ${hat}`,
+  title: 'Switch role',
+  close: 'Close',
+  actingNow: 'You are acting as',
+  current: 'Current',
+  needsCode: 'Needs a code',
+  switching: 'Switching…',
+  backTo: (hat: string) => `Back to ${hat}`,
+  confirmTitle: 'Confirm it’s you',
+  confirmBody: (hat: string, account: string) =>
+    `Enter the 6-digit code from your authenticator app to act as ${hat} on ${/^this /i.test(account) ? account.toLowerCase() : `the ${account}`}.`,
+  codeField: 'Code',
+  confirmButton: (hat: string) => `Switch to ${hat}`,
+  cancel: 'Cancel',
+  anotherWay: 'Use another way',
+  nowActing: (hat: string) => `Now acting as ${hat}.`,
+  switchBack: (hat: string) => `Switch back to ${hat}.`,
+  dismiss: 'Dismiss',
   actAs: 'Act as',
   asksForCode: 'asks for a code',
   signedInAs: (signedIn: string, acting: string) => `Signed in as ${signedIn}, acting as ${acting}.`,

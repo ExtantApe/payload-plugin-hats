@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- **A new hat switch.** A pill trigger ("Acting as Author"), a 360 px popover on wide screens and a bottom sheet under 640 px. It shows the hat worn now, then one fieldset per account (current account first) with a native radio per hat: safe hats first, then hats that ask for a code, tagged with a lock and Needs a code. Safe hats switch in one tap; the others open a code screen (Confirm it's you, Switch to <hat>, Cancel, and an optional Use another way). A Back to Member row stays at the bottom above the narrowest hat. Escape, close and the scrim return focus to the trigger, Cancel returns it to the hat, and focus stays in the panel while it's open.
+- **A note after each switch.** "Now acting as <hat>. Switch back to <narrowest hat>." in a status region for 5 seconds (longer while hovered or focused), kept in sessionStorage across the reload, with focus moved to the new page's heading. `HatsSwitchedNote` shows it on pages without a switch.
+- **Site options on `HatSwitcher`:** `accountTitle`, `hatHelp`, `orderHats`, `anotherWay` and `noteMs`, with defaults that need none of them. New exports: `HatsSwitchedNote`, `defaultOrder` and their types. New `text` keys for every new word; the old keys stay.
+- **Theme variables only.** The switch reads `--hats-*` variables, then the Payload admin's theme variables, then the surrounding text. The fixed fallback colors for focus and errors are gone.
+
+Tested: 34 new unit tests (order, which taps switch or ask, Back to Member, the 24-character trigger, fieldset and radio markup, Current and Needs a code tags, the code screen's aria-invalid and aria-describedby, focus targets, the note across a reload, no fixed colors). In a browser on a local site with made-up accounts at 390 and 1280 px: 30 checks, including keyboard open and Escape, arrows not switching, the focus trap, Cancel back to the hat, a one-tap switch, the note and its Switch back link, and Back to Member. Not tested: a real authenticator code through the new code screen, and screen readers.
+
+
 ## 0.2.0 (2026-11-16)
 
 - **`stepUpWhen`.** Decides whether a switch needs a code, in place of the hat's `sensitive` flag. It gets `from` and `to` (user as worn, and hat), so a site can ask only when the new hat holds a role or permission the current one doesn't. Only an exact `false` skips the code; `true`, a throw or any other answer asks. The `GET /hats` menu's `needsCode` follows the same rule. Without it, nothing changes.

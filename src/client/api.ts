@@ -60,6 +60,9 @@ export const defaultText = {
   /** The trigger's words; cut to 24 characters. */
   trigger: (hat: string) => `Acting as ${hat}`,
   title: 'Switch role',
+  /** The default heading for the current account's group, and for a linked account's. */
+  accountThis: 'This account',
+  accountLinked: 'Linked account',
   close: 'Close',
   actingNow: 'You are acting as',
   current: 'Current',

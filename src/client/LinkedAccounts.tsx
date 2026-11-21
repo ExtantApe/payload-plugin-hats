@@ -1,8 +1,9 @@
 'use client'
 
-import { useEffect, useId, useState, type CSSProperties, type FormEvent } from 'react'
+import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties, type FormEvent } from 'react'
 
 import { defaultText, hatsApi, type HatsMenu, type HatsText } from './api.js'
+import { linkedCss } from './styles.js'
 
 const v = (name: string, fallback: string) => `var(--hats-${name}, ${fallback})`
 const ink = v('ink', 'currentColor')
@@ -30,8 +31,19 @@ export function LinkedAccounts({ apiRoute = '/api', text, headingClassName }: { 
   const [said, setSaid] = useState('')
   const [busy, setBusy] = useState(false)
   const [unlinking, setUnlinking] = useState<string | number | null>(null)
-  const id = useId()
+  const id = useId().replace(/[^A-Za-z0-9_-]/g, '')
+  const focusNext = useRef<string | null>(null)
   const reload = () => api.menu().then(setMenu)
+
+  // Focus moves after the render that makes its target (WCAG 2.4.3): a pressed button that goes away or
+  // is replaced would otherwise drop focus to the page.
+  useLayoutEffect(() => {
+    if (!focusNext.current) return
+    const el = document.getElementById(focusNext.current)
+    if (!el) return
+    focusNext.current = null
+    el.focus()
+  })
 
   useEffect(() => {
     void reload()
@@ -57,13 +69,16 @@ export function LinkedAccounts({ apiRoute = '/api', text, headingClassName }: { 
     setBusy(false)
     setUnlinking(null)
     if (res.ok && res.body.signedOut) return window.location.reload()
+    // The row is gone after an unlink, so focus goes to the list's heading; after a refusal, back to that row's button.
+    focusNext.current = res.ok ? `${id}-h` : `${id}-unlink-${account}`
     setSaid(res.ok ? (you ? t.youUnlinked : t.unlinked) : res.message)
     await reload()
   }
 
   return (
     <section aria-labelledby={`${id}-h`}>
-      <h2 id={`${id}-h`} className={headingClassName}>
+      <style>{linkedCss}</style>
+      <h2 id={`${id}-h`} className={headingClassName} tabIndex={-1}>
         {t.linkedHeading}
       </h2>
       <p style={s.note}>{t.linkedIntro(menu.maxLinked)}</p>
@@ -79,15 +94,33 @@ export function LinkedAccounts({ apiRoute = '/api', text, headingClassName }: { 
               {unlinking === m.id ? (
                 <div role="group" aria-label={t.unlinkAsk(m.label)}>
                   <span>{t.unlinkAsk(m.you ? null : m.label)} </span>
-                  <button type="button" style={s.button} disabled={busy} onClick={() => void unlink(m.id, m.you)}>
+                  <button id={`${id}-confirm-${m.id}`} type="button" className="hats-la-btn" style={s.button} disabled={busy} onClick={() => void unlink(m.id, m.you)}>
                     {t.unlink}
                   </button>{' '}
-                  <button type="button" style={s.button} onClick={() => setUnlinking(null)}>
+                  <button
+                    type="button"
+                    className="hats-la-btn"
+                    style={s.button}
+                    onClick={() => {
+                      focusNext.current = `${id}-unlink-${m.id}`
+                      setUnlinking(null)
+                    }}
+                  >
                     {t.keep}
                   </button>
                 </div>
               ) : (
-                <button type="button" style={s.button} disabled={busy} onClick={() => setUnlinking(m.id)} aria-label={t.unlinkNamed(m.label)}>
+                <button
+                  id={`${id}-unlink-${m.id}`}
+                  type="button"
+                  className="hats-la-btn"
+                  style={s.button}
+                  disabled={busy}
+                  onClick={() => {
+                    focusNext.current = `${id}-confirm-${m.id}`
+                    setUnlinking(m.id)
+                  }}
+                  aria-label={t.unlinkNamed(m.label)}>
                   {t.unlink}
                 </button>
               )}
@@ -102,8 +135,8 @@ export function LinkedAccounts({ apiRoute = '/api', text, headingClassName }: { 
           <label htmlFor={`${id}-email`} style={{ display: 'block', marginBottom: 6 }}>
             {t.emailLabel}
           </label>
-          <input id={`${id}-email`} type="email" autoComplete="off" required style={s.input} value={email} onChange={(e) => setEmail(e.target.value)} />{' '}
-          <button type="submit" style={s.button} disabled={busy || !email.trim()}>
+          <input id={`${id}-email`} type="email" autoComplete="off" required className="hats-la-input" style={s.input} value={email} onChange={(e) => setEmail(e.target.value)} />{' '}
+          <button type="submit" className="hats-la-btn" style={s.button} disabled={busy || !email.trim()}>
             {t.send}
           </button>
         </form>

@@ -52,12 +52,11 @@ export const defaultOrder = (hats: MenuHat[]) => [...hats.filter((h) => !isSensi
 /** The hat worn now: the menu's hat, or the account's full set (the last hat) for a plain sign-in. */
 export const currentHatOf = (menu: SignedInMenu): MenuHat | undefined => menu.hats.find((h) => h.id === menu.hat) ?? menu.hats.at(-1)
 
-export const defaultAccountTitle = (a: AccountInfo) => (a.current ? 'This account' : 'Linked account')
 
 /** The groups, current account first, then linked accounts in the order the server gives. */
-export function groupsOf(menu: SignedInMenu, opts: SwitcherOptions = {}): Group[] {
+export function groupsOf(menu: SignedInMenu, opts: SwitcherOptions = {}, words: { accountThis: string; accountLinked: string } = { accountThis: 'This account', accountLinked: 'Linked account' }): Group[] {
   const order = opts.orderHats ?? defaultOrder
-  const title = opts.accountTitle ?? defaultAccountTitle
+  const title = opts.accountTitle ?? ((a: AccountInfo) => (a.current ? words.accountThis : words.accountLinked))
   const one = (id: string | number, email: string, hats: MenuHat[], current: boolean): Group => ({
     account: current ? undefined : id,
     id,

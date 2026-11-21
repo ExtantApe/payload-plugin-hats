@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- **Accessibility fixes on the switch, the note and the account page** (from a review against WCAG 2.2 AA).
+  - **Error line (4.1.3).** The error region is always in the page and hidden with a clip pattern while empty, never `display:none`, so screen readers announce the first error.
+  - **Switching status (4.1.3).** `aria-busy` moved from the panel body to the hat rows, so the Switching… status isn't muted. Rows were already `aria-disabled`.
+  - **Banner over focus (2.4.11).** While the note shows, the page gets `scroll-padding-bottom` as tall as the banner covers, and it's put back after. Chosen over moving the banner into the page flow because it causes no layout shift and works wherever a site mounts the note.
+  - **Focus after Dismiss (2.4.3).** Goes to the switch trigger, else the page's h1 or main region.
+  - **Linked accounts focus (2.4.3).** Unlink focuses the first button of the confirm group, Keep returns to that row's Unlink, and after an unlink focus goes to the list heading (after a refusal, back to the row's button).
+  - **Trigger and tag borders (1.4.11).** Use `--hats-field` (elevation 600), like the code field.
+  - **Focus ring and target (2.4.7, 2.5.8).** The account page's buttons and email field get a `:focus-visible` ring from `--hats-focus`, so it shows outside Payload admin. Use another way is at least 32 px high.
+  - **Text props (3.1.2).** The default group headings are now `text.accountThis` and `text.accountLinked`, so every visible word can be translated. The README lists every key.
+  - **README** says to mount `HatsSwitchedNote` (already exported from `/client`) in a site's layout.
+
+Tested: 16 new jsdom tests (an always-present error region with no `display:none`, `aria-busy` on rows only, scroll padding set and restored, focus after Dismiss with and without a trigger, focus through Unlink, Keep, an unlink and a refused unlink, border and ring and 32 px rules in the CSS, no English default left when every text key is replaced, the client entry's exports); full suite 91 passing, typecheck and build clean. Not tested: screen readers (VoiceOver), a real browser, and measured contrast. `scroll-padding-bottom` is checked as a set value in jsdom, not as real scrolling.
+
 ## 0.3.0 (2026-11-20)
 
 - **A new hat switch.** A pill trigger ("Acting as Author"), a 360 px popover on wide screens and a bottom sheet under 640 px. It shows the hat worn now, then one fieldset per account (current account first) with a button per hat (`aria-current` on the one worn): safe hats first, then hats that ask for a code, tagged with a lock and Needs a code. Safe hats switch in one tap; the others open a code screen (Confirm it's you, Switch to <hat>, Cancel, and an optional Use another way). A Back to Member row stays at the bottom above the narrowest hat. Escape, close and the scrim return focus to the trigger, Cancel returns it to the hat, and focus stays in the panel while it's open.

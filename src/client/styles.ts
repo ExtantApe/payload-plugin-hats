@@ -35,7 +35,7 @@ export const css = `
 .hats-sw *{box-sizing:border-box}
 .hats-sw :focus-visible,.hats-sw-note :focus-visible{outline:${t.focus};outline-offset:2px}
 .hats-sw-vh{position:absolute!important;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
-.hats-sw-trigger{font:inherit;color:${t.ink};background:${t.paper};border:1px solid ${t.line};border-radius:999px;min-height:36px;padding:4px 14px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+.hats-sw-trigger{font:inherit;color:${t.ink};background:${t.paper};border:1px solid ${t.field};border-radius:999px;min-height:36px;padding:4px 14px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
 .hats-sw-trigger:hover{background:${t.hover}}
 .hats-sw-scrim{display:none}
 .hats-sw-panel{position:absolute;inset-inline-end:0;top:calc(100% + 6px);z-index:60;width:360px;max-width:90vw;max-height:min(80vh,640px);display:flex;flex-direction:column;background:${t.paper};color:${t.ink};border:1px solid ${t.line};border-radius:${t.radius};box-shadow:${t.shadow};text-align:start;white-space:normal;overflow-wrap:anywhere;line-height:1.4}
@@ -52,7 +52,7 @@ export const css = `
 .hats-sw-now-label{font-size:${t.small};color:${t.muted};margin:0}
 .hats-sw-now-hat{font-weight:600;margin:2px 0 0;display:flex;flex-wrap:wrap;align-items:center;gap:${t.gap}}
 .hats-sw-help{font-size:${t.small};color:${t.muted};margin:2px 0 0}
-.hats-sw-tag{font-size:${t.small};font-weight:600;border:1px solid ${t.line};border-radius:999px;padding:0 8px;line-height:1.6;white-space:nowrap;display:inline-flex;align-items:center;gap:4px;flex:none}
+.hats-sw-tag{font-size:${t.small};font-weight:600;border:1px solid ${t.field};border-radius:999px;padding:0 8px;line-height:1.6;white-space:nowrap;display:inline-flex;align-items:center;gap:4px;flex:none}
 .hats-sw-group{border:0;margin:${t.space} 0 0;padding:${t.space} 0 0;min-inline-size:0;border-top:1px solid ${t.line}}
 .hats-sw-group legend{padding:0;margin:0 0 ${t.gap};float:left;width:100%}
 .hats-sw-group legend+*{clear:both}
@@ -77,13 +77,19 @@ export const css = `
 .hats-sw-code{padding-top:${t.gap}}
 .hats-sw-code p{margin:0 0 12px}
 .hats-sw-code .hats-sw-more{margin-top:${t.gap}}
+.hats-sw-more .hats-sw-link{min-height:32px;min-width:32px;display:inline-flex;align-items:center}
 .hats-sw-code label{display:block;font-weight:600;margin-bottom:4px}
 .hats-sw-input{font:inherit;font-size:1.25rem;letter-spacing:.15em;color:${t.ink};background:${t.paper};border:1px solid ${t.field};border-radius:${t.radiusSmall};min-height:${t.row};padding:6px 12px;width:100%;max-width:14em}
 .hats-sw-input[aria-invalid="true"]{border-color:${t.error};border-width:2px}
 .hats-sw-actions{display:flex;flex-wrap:wrap;gap:${t.gap};margin-top:${t.space}}
 .hats-sw-error{color:${t.error};font-size:${t.small};margin:6px 0 0}
-.hats-sw-error:empty{display:none}
+.hats-sw-error:empty{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
 .hats-sw-banner{position:fixed;z-index:70;inset-inline:${t.space};bottom:calc(${t.space} + env(safe-area-inset-bottom));margin-inline:auto;max-width:480px;display:flex;align-items:center;gap:${t.gap};background:${t.paper};color:${t.ink};border:1px solid ${t.line};border-radius:${t.radius};box-shadow:${t.shadow};padding:${t.gap} ${t.gap} ${t.gap} ${t.space}}
 .hats-sw-banner:empty{display:none}
 .hats-sw-banner p{margin:0;flex:1 1 auto}
+`
+
+/** The account page's buttons carry inline styles, so their focus ring comes from here and works outside Payload admin. */
+export const linkedCss = `
+.hats-la-btn:focus-visible,.hats-la-input:focus-visible{outline:${t.focus};outline-offset:2px}
 `

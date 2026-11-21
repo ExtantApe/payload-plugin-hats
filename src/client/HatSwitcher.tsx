@@ -139,7 +139,7 @@ export function SwitcherView(p: SwitcherViewProps) {
           <span aria-hidden="true">×</span>
         </button>
       </div>
-      <div className="hats-sw-body" aria-busy={busy ? true : undefined}>
+      <div className="hats-sw-body">
         {current ? (
           <div className="hats-sw-now">
             <p className="hats-sw-now-label">{t.actingNow}</p>
@@ -157,7 +157,7 @@ export function SwitcherView(p: SwitcherViewProps) {
               <span className="hats-sw-acct">{g.title}</span>
               <span className="hats-sw-email">{g.email}</span>
             </legend>
-            <div className="hats-sw-rows">
+            <div className="hats-sw-rows" aria-busy={busy ? true : undefined}>
               {g.hats.map((h) => {
                 const rid = radioId(base, g.account, h.id)
                 const isCurrent = actionFor(g, h, current) === 'none'
@@ -249,7 +249,7 @@ export function HatSwitcher({ apiRoute = '/api', onSwitched, text, anotherWay, n
   })
 
   const signedIn = menu?.signedIn ? menu : null
-  const groups = signedIn ? groupsOf(signedIn, opts) : []
+  const groups = signedIn ? groupsOf(signedIn, opts, t) : []
   const current = signedIn ? currentHatOf(signedIn) : undefined
   const back = signedIn ? backHat(signedIn) : null
   const currentRadio = current ? radioId(base, undefined, current.id) : ''

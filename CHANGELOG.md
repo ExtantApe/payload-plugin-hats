@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.1 (2026-11-21)
 
 - **Accessibility fixes on the switch, the note and the account page** (from a review against WCAG 2.2 AA).
   - **Error line (4.1.3).** The error region is always in the page and hidden with a clip pattern while empty, never `display:none`, so screen readers announce the first error.

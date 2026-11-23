@@ -2,6 +2,12 @@
 
 Newest first.
 
+## 2026-11-22: stepUpWhen, the redesigned switch and the accessibility fixes (0.2.0 to 0.3.1)
+
+- Promises: only gaining roles asks for a code; `stepUpWhen` failing, rejecting or answering anything but false asks for a code, and a site with no second factor on that account still refuses; a code covers its own account unless `rememberPer` is set, then a set for three hours; `steppedUp` is reported only when a code was given; safe hats switch on a tap and sensitive ones confirm; the switch, the note and the account page meet WCAG 2.2 AA (live region present while empty, focus after Dismiss, Unlink and refusals, focus ring and border tokens for 1.4.11, a 32px minimum target for 2.5.8, no English defaults left when every text is replaced).
+- Covered: `test/hats.test.ts` (step-up and memory), `test/switcher.test.tsx` (the switch), `test/a11y.test.tsx` (each accessibility fix).
+- Gaps skipped (and why): the release commits only changed version numbers.
+
 ## 2026-11-11: `limit` and `blocked` fail closed
 
 Suite: 24 tests before, 26 after (`npx vitest run`, same setup). Finishes the two items raised below.

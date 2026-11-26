@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.0 (Unreleased)
+
+- **`switchSession(req, { account, hat, code })`.** A site's own route can switch the signed-in person without the picker. The body of `POST /hats/switch` moved into one shared function that the endpoint and `switchSession` both call, so they can't drift. It acts only for `req.user` (refused with `signIn` when nobody is signed in), has no option that skips a check, and returns `{ ok: true, account, hat, cookie }` or `{ ok: false, status, reason, message }` with the endpoint's reasons, `needsCode` included. An error from a site hook, or any unexpected error, is a refusal (`failed`, 500), never a pass. The endpoint answers as before (the Payload error shape, and 401 `needsCode` with its body); the one visible change is that a missing Payload session now carries the reason `noSessions`. New exports: `switchSession`, `SwitchResult`, `SwitchInput`.
+- **Call it from a same-origin POST only.** The README says why: SameSite=Lax sends the cookie on a top-level GET, so a link on another site could switch someone silently while a code is still remembered. The plugin can't see the method or origin, so the site checks it.
+- **One code per sitting.** `stepUp.rememberPer: 'set'` (added in 0.2.0) with a gain-based `stepUpWhen` is the supported way: one code covers the person's set for `rememberMinutes` (default 180), then it asks again. Documented, and now tested with the expiry and `rememberMinutes`. Switching back down to the signed-in account asks for no code.
+
+Tested: 12 new tests, each refusal through `switchSession` and the endpoint with the same status and reason (and the same call passing once the guard is lifted); no user; a user with no browser session; the endpoint and the function giving the same cookie attributes and session effects; ignored skip options; throwing `verify`, `available`, `blocked`, `stepUpWhen`, `showSwitch` and `hatsOf`; the set remembered across accounts, 179 and 181 minutes, `rememberMinutes` 30; back to the signed-in account with no code; refusal while blocked and after an unlink. The new tests fail before the change (`switchSession` missing) and pass after. Full suite 103 passing, typecheck and build clean. Not tested: a real browser or site route, the same-origin check (it's the site's), and a throwing `onEvent` (it runs after the switch and is reported as a failed switch, with the session already moved).
+
 ## 0.3.1 (2026-11-21)
 
 - **Accessibility fixes on the switch, the note and the account page** (from a review against WCAG 2.2 AA).

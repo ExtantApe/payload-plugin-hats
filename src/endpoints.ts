@@ -113,6 +113,119 @@ const me: Endpoint = {
   },
 }
 
+/** What a switch came to. A refusal carries the endpoint's `reason` (`needsCode` included) and its English message. */
+export type SwitchResult =
+  | { ok: true; account: string; hat: string; /** The Set-Cookie value for the new session, or null when the hat changed on the same account. */ cookie: string | null }
+  | { ok: false; status: number; reason: string; message: string }
+
+/** The input of a switch: the same three fields the endpoint reads from its body. */
+export type SwitchInput = { account?: unknown; hat?: unknown; code?: unknown }
+
+/**
+ * The one switch, shared by POST /api/hats/switch and `switchSession`, so the two can't drift. It acts only for
+ * `req.user` and has no option that skips a check. Any failure, an error from a host hook included, is a refusal.
+ */
+export async function runSwitch(req: PayloadRequest, input: SwitchInput | null | undefined): Promise<SwitchResult> {
+  try {
+    return await switchCore(req, input ?? {})
+  } catch (error) {
+    if (error instanceof APIError) {
+      const reason = (error.data as { reason?: unknown } | undefined)?.reason
+      return { ok: false, status: error.status, reason: typeof reason === 'string' ? reason : 'failed', message: error.message }
+    }
+    req.payload?.logger?.warn({ err: error }, 'Hats: switch refused after an unexpected error')
+    return { ok: false, status: 500, reason: 'failed', message: 'Switching didn’t work. Try again.' }
+  }
+}
+
+async function switchCore(req: PayloadRequest, body: SwitchInput): Promise<SwitchResult> {
+  const { opts, full, state, person } = await actor(req)
+  await blockedReason(req, opts)
+  const current = String(full.id)
+  const to = body.account == null || body.account === '' ? current : String(body.account)
+
+  let link: string | null = null
+  if (to !== current) {
+    link = await sharedLink(req.payload, current, to, req)
+    if (!link) refuse('That account isn’t linked to this one.', 403, 'notLinked')
+  }
+  const target = to === current ? full : await loadUser(req, to)
+  if (!target) refuse('That account isn’t linked to this one.', 403, 'notLinked')
+  const { linked } = await linkedAccounts(req, current)
+  if (!(opts.showSwitch ?? defaultShow)({ user: full, hats: opts.hatsOf(full), linked })) refuse('Switching isn’t available for this account.', 403, 'notAvailable')
+
+  const hats = opts.hatsOf(target!)
+  const hat = typeof body.hat === 'string' ? hats.find((h) => h.id === body.hat) : to === current ? undefined : hats[0]
+  if (!hat) refuse('Choose one of that account’s hats.', 400, 'chooseHat')
+
+  const s = await sessionBySid(req.payload, state.sid, req)
+  const nowWearing = to === current ? (wornHat(hats, s) ?? hats.at(-1))!.id : null
+  const steppedUp = { ...(s?.steppedUp ?? {}) }
+  let gaveCode = false
+  const setId = (await membershipOf(req, to).then((m) => (m?.status === 'approved' ? idOf(m.link) : null))) ?? null
+  const from = { user: req.user as HatsUser, hat: wornHat(opts.hatsOf(full), s)?.id ?? opts.hatsOf(full).at(-1)?.id ?? null }
+  if (hat!.id !== nowWearing && (await needsStepUp(opts, { req, from, target: target!, hats, hat: hat! })) && !remembered(opts, steppedUp, to, setId)) {
+    if (!opts.stepUp) refuse('This site has no second factor for switching up.', 403, 'noSecondFactor')
+    // Only an exact `true` passes either check; a truthy answer such as `{ valid: false }`, or a thrown error, is a no.
+    const stepUp = opts.stepUp!
+    const ctx = { signedIn: (person === current ? full : await loadUser(req, person)) ?? full, set: setId }
+    if (!(await exactlyTrue(() => stepUp.available(target!, ctx)))) refuse('Set up two-step sign-in on that account first.', 403, 'setUpTwoStep')
+    const code = typeof body.code === 'string' ? body.code.trim() : ''
+    if (!code) return { ok: false, status: 401, reason: 'needsCode', message: 'Enter a code from that account’s authenticator app.' }
+    if (!(await exactlyTrue(() => stepUp.verify({ req, user: target!, code, ...ctx })))) refuse('That code didn’t work. Try a new one.', 403, 'wrongCode')
+    steppedUp[memoryKey(opts, to, setId)] = new Date().toISOString()
+    gaveCode = true
+  }
+
+  const users = req.payload.collections[opts.users as never]!.config
+  if (to === current) {
+    await asPlugin(req, async () => {
+      if (s) await req.payload.update({ collection: SESSIONS as never, id: s.id, data: { hat: hat!.id, steppedUp } as never, overrideAccess: true, req })
+      else await req.payload.create({ collection: SESSIONS as never, data: { sid: state.sid, user: current, hat: hat!.id, steppedUp, expiresAt: expiry(users.auth.tokenExpiration) } as never, overrideAccess: true, req })
+    })
+    await opts.onEvent?.({ type: 'switched', req, from: current, to, hat: hat!.id, via: person, steppedUp: gaveCode })
+    return { ok: true, account: to, hat: hat!.id, cookie: null }
+  }
+
+  // Another account: a fresh Payload session for it, then this one ends.
+  const own = person === to
+  const { sid } = await addSessionToUser({ collectionConfig: users, payload: req.payload, req, user: target as never })
+  if (!sid) refuse('Switching accounts needs Payload sessions (auth.useSessions).', 500, 'noSessions')
+  await asPlugin(req, () =>
+    req.payload.create({
+      collection: SESSIONS as never,
+      data: { sid, user: to, via: own ? null : person, link: own ? null : link, hat: hat!.id, steppedUp, expiresAt: expiry(users.auth.tokenExpiration) } as never,
+      overrideAccess: true,
+      req,
+    }),
+  )
+  await revokeSid(req.payload, current, state.sid, req)
+  if (s) await tombstone(req.payload, s.id, req)
+  else
+    await asPlugin(req, () =>
+      req.payload.create({ collection: SESSIONS as never, data: { sid: state.sid, user: current, revokedAt: new Date().toISOString(), expiresAt: expiry(users.auth.tokenExpiration) } as never, overrideAccess: true, req }),
+    )
+  await cleanupSessions(req.payload, req).catch((err) => req.payload.logger.warn({ err }, 'Hats: session clean-up skipped'))
+  const { token } = await jwtSign({
+    fieldsToSign: getFieldsToSign({ collectionConfig: users, email: String(target!.email ?? ''), sid, user: target as never }),
+    secret: req.payload.secret,
+    tokenExpiration: users.auth.tokenExpiration,
+  })
+  const cookie = generateCookie<string>({
+    name: `${req.payload.config.cookiePrefix}-token`,
+    value: token,
+    path: '/',
+    httpOnly: true,
+    secure: users.auth.cookies.secure,
+    sameSite: typeof users.auth.cookies.sameSite === 'string' ? users.auth.cookies.sameSite : 'Lax',
+    domain: users.auth.cookies.domain ?? undefined,
+    expires: new Date(Date.now() + users.auth.tokenExpiration * 1000),
+    returnCookieAsObject: false,
+  })
+  await opts.onEvent?.({ type: 'switched', req, from: current, to, hat: hat!.id, via: person, steppedUp: gaveCode })
+  return { ok: true, account: to, hat: hat!.id, cookie }
+}
+
 /**
  * POST /api/hats/switch { account?, hat, code? }: wear another hat, on this account or another approved account in
  * the same set. A sensitive hat needs that account's second factor unless it was given here recently.
@@ -122,92 +235,10 @@ const switchHat: Endpoint = {
   method: 'post',
   handler: async (req) => {
     await addDataAndFileToRequest(req)
-    const { opts, full, state, person } = await actor(req)
-    await blockedReason(req, opts)
-    const body = (req.data ?? {}) as { account?: unknown; hat?: unknown; code?: unknown }
-    const current = String(full.id)
-    const to = body.account == null || body.account === '' ? current : String(body.account)
-
-    let link: string | null = null
-    if (to !== current) {
-      link = await sharedLink(req.payload, current, to, req)
-      if (!link) refuse('That account isn’t linked to this one.', 403, 'notLinked')
-    }
-    const target = to === current ? full : await loadUser(req, to)
-    if (!target) refuse('That account isn’t linked to this one.', 403, 'notLinked')
-    const { linked } = await linkedAccounts(req, current)
-    if (!(opts.showSwitch ?? defaultShow)({ user: full, hats: opts.hatsOf(full), linked })) refuse('Switching isn’t available for this account.', 403, 'notAvailable')
-
-    const hats = opts.hatsOf(target!)
-    const hat = typeof body.hat === 'string' ? hats.find((h) => h.id === body.hat) : to === current ? undefined : hats[0]
-    if (!hat) refuse('Choose one of that account’s hats.', 400, 'chooseHat')
-
-    const s = await sessionBySid(req.payload, state.sid, req)
-    const nowWearing = to === current ? (wornHat(hats, s) ?? hats.at(-1))!.id : null
-    const steppedUp = { ...(s?.steppedUp ?? {}) }
-    let gaveCode = false
-    const setId = (await membershipOf(req, to).then((m) => (m?.status === 'approved' ? idOf(m.link) : null))) ?? null
-    const from = { user: req.user as HatsUser, hat: wornHat(opts.hatsOf(full), s)?.id ?? opts.hatsOf(full).at(-1)?.id ?? null }
-    if (hat!.id !== nowWearing && (await needsStepUp(opts, { req, from, target: target!, hats, hat: hat! })) && !remembered(opts, steppedUp, to, setId)) {
-      if (!opts.stepUp) refuse('This site has no second factor for switching up.', 403, 'noSecondFactor')
-      // Only an exact `true` passes either check; a truthy answer such as `{ valid: false }`, or a thrown error, is a no.
-      const stepUp = opts.stepUp!
-      const ctx = { signedIn: (person === current ? full : await loadUser(req, person)) ?? full, set: setId }
-      if (!(await exactlyTrue(() => stepUp.available(target!, ctx)))) refuse('Set up two-step sign-in on that account first.', 403, 'setUpTwoStep')
-      const code = typeof body.code === 'string' ? body.code.trim() : ''
-      if (!code) return json({ ok: false, needsCode: true, reason: 'needsCode', message: 'Enter a code from that account’s authenticator app.' }, 401)
-      if (!(await exactlyTrue(() => stepUp.verify({ req, user: target!, code, ...ctx })))) refuse('That code didn’t work. Try a new one.', 403, 'wrongCode')
-      steppedUp[memoryKey(opts, to, setId)] = new Date().toISOString()
-      gaveCode = true
-    }
-
-    const users = req.payload.collections[opts.users as never]!.config
-    if (to === current) {
-      await asPlugin(req, async () => {
-        if (s) await req.payload.update({ collection: SESSIONS as never, id: s.id, data: { hat: hat!.id, steppedUp } as never, overrideAccess: true, req })
-        else await req.payload.create({ collection: SESSIONS as never, data: { sid: state.sid, user: current, hat: hat!.id, steppedUp, expiresAt: expiry(users.auth.tokenExpiration) } as never, overrideAccess: true, req })
-      })
-      await opts.onEvent?.({ type: 'switched', req, from: current, to, hat: hat!.id, via: person, steppedUp: gaveCode })
-      return json({ ok: true, account: to, hat: hat!.id, reload: true })
-    }
-
-    // Another account: a fresh Payload session for it, then this one ends.
-    const own = person === to
-    const { sid } = await addSessionToUser({ collectionConfig: users, payload: req.payload, req, user: target as never })
-    if (!sid) refuse('Switching accounts needs Payload sessions (auth.useSessions).', 500)
-    await asPlugin(req, () =>
-      req.payload.create({
-        collection: SESSIONS as never,
-        data: { sid, user: to, via: own ? null : person, link: own ? null : link, hat: hat!.id, steppedUp, expiresAt: expiry(users.auth.tokenExpiration) } as never,
-        overrideAccess: true,
-        req,
-      }),
-    )
-    await revokeSid(req.payload, current, state.sid, req)
-    if (s) await tombstone(req.payload, s.id, req)
-    else
-      await asPlugin(req, () =>
-        req.payload.create({ collection: SESSIONS as never, data: { sid: state.sid, user: current, revokedAt: new Date().toISOString(), expiresAt: expiry(users.auth.tokenExpiration) } as never, overrideAccess: true, req }),
-      )
-    await cleanupSessions(req.payload, req).catch((err) => req.payload.logger.warn({ err }, 'Hats: session clean-up skipped'))
-    const { token } = await jwtSign({
-      fieldsToSign: getFieldsToSign({ collectionConfig: users, email: String(target!.email ?? ''), sid, user: target as never }),
-      secret: req.payload.secret,
-      tokenExpiration: users.auth.tokenExpiration,
-    })
-    const cookie = generateCookie<string>({
-      name: `${req.payload.config.cookiePrefix}-token`,
-      value: token,
-      path: '/',
-      httpOnly: true,
-      secure: users.auth.cookies.secure,
-      sameSite: typeof users.auth.cookies.sameSite === 'string' ? users.auth.cookies.sameSite : 'Lax',
-      domain: users.auth.cookies.domain ?? undefined,
-      expires: new Date(Date.now() + users.auth.tokenExpiration * 1000),
-      returnCookieAsObject: false,
-    })
-    await opts.onEvent?.({ type: 'switched', req, from: current, to, hat: hat!.id, via: person, steppedUp: gaveCode })
-    return json({ ok: true, account: to, hat: hat!.id, reload: true }, 200, [cookie])
+    const result = await runSwitch(req, (req.data ?? {}) as SwitchInput)
+    if (result.ok) return json({ ok: true, account: result.account, hat: result.hat, reload: true }, 200, result.cookie ? [result.cookie] : [])
+    if (result.reason === 'needsCode') return json({ ok: false, needsCode: true, reason: 'needsCode', message: result.message }, 401)
+    return refuse(result.message, result.status, result.reason)
   },
 }
 

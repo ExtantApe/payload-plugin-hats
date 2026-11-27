@@ -54,5 +54,45 @@ export async function withMark<T>(req: PayloadRequest, mark: Mark, fn: () => Pro
 /** Runs `fn` with the request marked as the plugin's own, then puts the mark back as it was. */
 export const asPlugin = <T>(req: PayloadRequest, fn: () => Promise<T>): Promise<T> => withMark(req, INTERNAL, fn)
 
+/**
+ * An id as a relationship to `slug` stores it: a number where that collection's ids are numbers (SQL adapters by
+ * default, or a custom number id), otherwise as it is. The plugin compares ids as strings, so every id it writes
+ * into a relationship goes through this first.
+ */
+export function relId(payload: Payload, slug: string, v: unknown): string | number | null {
+  if (v == null) return null
+  const id = idOf(v)
+  const type = (payload.collections as Record<string, { customIDType?: string } | undefined>)[slug]?.customIDType ?? payload.db.defaultIDType
+  return type === 'number' && /^-?\d+(\.\d+)?$/.test(id) ? Number(id) : id
+}
+
+/**
+ * Runs one of the site's own callbacks with the plugin's marks off the request, so nothing the site does from it
+ * passes as the plugin. The marks come back afterwards.
+ */
+export async function unmarked<T>(req: PayloadRequest | undefined, fn: () => T | Promise<T>): Promise<T> {
+  const held = req ? marks.get(req) : undefined
+  if (!held) return await fn()
+  marks.delete(req!)
+  try {
+    return await fn()
+  } finally {
+    const now = marks.get(req!)
+    if (now) for (const [k, v] of held) now.set(k, (now.get(k) ?? 0) + v)
+    else marks.set(req!, held)
+  }
+}
+
+/** Link requests still working after their answer, so tests (and a graceful shutdown) can wait for them. */
+const working = new Set<Promise<unknown>>()
+export function trackWork(p: Promise<unknown>) {
+  working.add(p)
+  void p.finally(() => working.delete(p))
+}
+/** Resolves once every link request's work has finished, including any started meanwhile. */
+export async function linkWorkSettled() {
+  while (working.size) await Promise.allSettled([...working])
+}
+
 export const idOf = (v: unknown) => String(v && typeof v === 'object' && 'id' in v ? (v as { id: unknown }).id : v)
 export type { HatsUser }

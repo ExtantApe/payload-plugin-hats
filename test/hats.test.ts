@@ -4,7 +4,7 @@ import { buildConfig, createLocalReq, createPayloadRequest, getPayload, type San
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 
 import { applyHat, cleanupSessions, hats, hatsStateOf, MEMBERS, REQUESTS, SESSIONS, switchSession, type Hat, type HatsEvent, type HatsUser } from '../src/index.js'
-import { asPlugin, hashToken } from '../src/state.js'
+import { asPlugin, hashToken, isInternal, linkWorkSettled } from '../src/state.js'
 import type { ResolvedHatsOptions } from '../src/types.js'
 
 /**
@@ -28,8 +28,28 @@ const PW = 'correct-horse-battery'
 const mail: { to: string; text: string }[] = []
 const events: HatsEvent[] = []
 let masquerading = false
+/**
+ * MongoDB in memory by default. `HATS_DB=sqlite` runs the same suite on SQLite, for a check by hand with
+ * `npm install --no-save @payloadcms/db-sqlite` (it isn't a dependency); its file lives in a temp folder this suite
+ * makes and removes. Tests that count MongoDB's own write calls are skipped there.
+ */
+const SQLITE = process.env.HATS_DB === 'sqlite'
+let sqliteDir: string | undefined
+async function database() {
+  if (!SQLITE) {
+    mongo = await MongoMemoryReplSet.create({ replSet: { count: 1, storageEngine: 'wiredTiger' } })
+    return mongooseAdapter({ url: mongo.getUri('hats'), ensureIndexes: true })
+  }
+  const { mkdtemp } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  sqliteDir = await mkdtemp(join(tmpdir(), 'hats-sqlite-'))
+  const name = '@payloadcms/db-sqlite'
+  const { sqliteAdapter } = (await import(name)) as { sqliteAdapter: (args: unknown) => never }
+  return sqliteAdapter({ client: { url: `file:${join(sqliteDir, 'hats.db')}` }, push: true })
+}
 /** Stand-in answers for the site's own checks, so a test can make them say something other than true or false. */
-const answers: { approve?: () => unknown; available?: () => unknown; verify?: () => unknown; limit?: () => unknown; blocked?: () => unknown; event?: (e: HatsEvent) => unknown } = {}
+const answers: { approve?: () => unknown; available?: () => unknown; verify?: () => unknown; limit?: () => unknown; blocked?: () => unknown; event?: (e: HatsEvent) => unknown; confirmURL?: (args: { req: PayloadRequest; token: string }) => string } = {}
 /** Truthy answers that aren't `true`, and a thrown error: every one must be a no. */
 const NOT_TRUE: [string, () => unknown][] = [
   ['1', () => 1],
@@ -49,6 +69,8 @@ const plugin = async <T,>(fn: (req: PayloadRequest) => Promise<T>) => {
   const req = await createLocalReq({}, payload)
   return asPlugin(req, () => fn(req))
 }
+/** Off only in tests that time the answer itself or hold a send open on purpose. */
+let settleLinks = true
 const tokenFrom = (text: string) => /token=([\w-]+)/.exec(text)?.[1] ?? ''
 const endpoint = (path: string, method: string) => (payload.config.endpoints as Endpoint[]).find((e) => e.path === path && e.method === method)!
 /** The signed-in user for a token, exactly as REST, GraphQL and the admin see it (Payload's auth strategies). */
@@ -65,6 +87,8 @@ async function call(path: string, token: string | null, body: unknown = {}, meth
   ;(req as unknown as { json: () => Promise<unknown> }).json = async () => body
   try {
     const res = await endpoint(path, method).handler(req)
+    // A link request answers after linkAnswerMs and may still be working; wait for it, so what it mails is there.
+    if (path === '/hats/link' && settleLinks) await linkWorkSettled()
     const text = await res.text()
     const cookie = res.headers.getSetCookie().find((c) => c.startsWith('payload-token='))
     return { status: res.status, body: text.startsWith('{') ? JSON.parse(text) : text, token: cookie ? cookie.split(';')[0]!.slice('payload-token='.length) : null }
@@ -109,12 +133,11 @@ async function link(from: U, to: U, approver: U) {
 }
 
 beforeAll(async () => {
-  mongo = await MongoMemoryReplSet.create({ replSet: { count: 1, storageEngine: 'wiredTiger' } })
   config = await buildConfig({
       secret: 'test-secret-not-for-production',
       telemetry: false,
       typescript: { autoGenerate: false },
-      db: mongooseAdapter({ url: mongo.getUri('hats'), ensureIndexes: true }),
+      db: await database(),
       collections: [
         {
           slug: 'users',
@@ -148,6 +171,8 @@ beforeAll(async () => {
           },
           sendEmail: async ({ to, text }) => void mail.push({ to, text }),
           linkAnswerMs: 100,
+          // The plugin's own default, unless a test asks otherwise.
+          confirmURL: (args) => (answers.confirmURL ? answers.confirmURL(args) : `https://site.example/api/hats/confirm?token=${args.token}`),
           onEvent: (e) => {
             events.push(e)
             if (answers.event) return answers.event(e) as void
@@ -161,6 +186,7 @@ beforeAll(async () => {
 afterAll(async () => {
   await payload?.destroy()
   await mongo?.stop()
+  if (sqliteDir) await (await import('node:fs/promises')).rm(sqliteDir, { recursive: true, force: true }) // only the folder this suite made
 })
 
 let n = 0
@@ -173,6 +199,7 @@ beforeEach(() => {
   delete answers.limit
   delete answers.blocked
   delete answers.event
+  delete answers.confirmURL
   mail.length = 0
 })
 
@@ -1356,7 +1383,7 @@ describe('a link request answers the same way whatever the address', () => {
     return out
   }
 
-  it('gives the same answer, asker email, readable records, database writes and pending count for every kind of address', async () => {
+  it.skipIf(SQLITE)('gives the same answer, asker email, readable records, database writes and pending count for every kind of address', async () => {
     await observe('existing') // warm-up: clears expired rows and loads every code path once
     const seen: Record<string, unknown> = {}
     for (const kind of Object.keys(BRANCHES)) seen[kind] = await observe(kind)
@@ -1392,6 +1419,7 @@ describe('a link request answers the same way whatever the address', () => {
       for (const mode of ['ok', 'slow', 'hang', 'fail'] as const) {
         const asker = await make(email('asker'), 'member')
         const target = await make(email('t'), 'member')
+        settleLinks = false
         let inviteDone = false
         opts.sendEmail = async ({ to, text }) => {
           if (to === target.email && mode !== 'ok') {
@@ -1426,6 +1454,8 @@ describe('a link request answers the same way whatever the address', () => {
       }
     } finally {
       release()
+      settleLinks = true
+      await linkWorkSettled()
       opts.sendEmail = saved.send
       opts.linkAnswerMs = saved.ms
     }
@@ -1447,6 +1477,7 @@ describe('a link request answers the same way whatever the address', () => {
       }
       return median(times)
     }
+    settleLinks = false
     try {
       const report: Record<string, string> = {}
       for (const ms of [saved, 0]) {
@@ -1456,6 +1487,8 @@ describe('a link request answers the same way whatever the address', () => {
       }
       console.log('hats link answer medians:', JSON.stringify(report))
     } finally {
+      settleLinks = true
+      await linkWorkSettled()
       opts.linkAnswerMs = saved
     }
   })
@@ -1744,9 +1777,6 @@ describe('link requests after review', () => {
       const replies = await Promise.all(tokens.map((t) => call('/hats/link', t, { email: target.email })))
       expect(Date.now() - started).toBeGreaterThanOrEqual(100)
       for (const r of replies) expect([r.status, r.body]).toEqual([reference.status, reference.body])
-      // Work past the answer may still be finishing under this load; wait for every asker's note (up to 5 s).
-      for (let i = 0; i < 50 && mail.filter((m) => askers.some((a) => a.email === m.to)).length < askers.length * reference.mail; i++) await new Promise((r) => setTimeout(r, 100))
-      await new Promise((r) => setTimeout(r, 100))
       expect(mail.filter((m) => m.to === target.email)).toHaveLength(1)
       for (const a of askers) expect(mail.filter((m) => m.to === a.email)).toHaveLength(reference.mail)
       expect(await requestsTo(target)).toBe(1)
@@ -1784,6 +1814,73 @@ describe('link requests after review', () => {
     } finally {
       payload.logger.error = error
     }
+  })
+
+  it('confirms and still sends link-confirmed when a handler’s error has a name that throws or isn’t a plain word, and logs only a short safe name', async () => {
+    const logged: unknown[] = []
+    const error = payload.logger.error.bind(payload.logger)
+    payload.logger.error = ((...args: unknown[]) => void logged.push(args)) as never
+    try {
+      const odd: (() => unknown)[] = [
+        () => Object.defineProperty(new Error('made-up'), 'name', { get: () => { throw new Error('made-up getter failure') } }),
+        () => Object.assign(new Error('made-up'), { name: 'Bad name with spaces and an address someone@example.invalid' }),
+        () => Object.assign(new Error('made-up'), { name: 'X'.repeat(80) }),
+        () => 'a thrown string about someone@example.invalid',
+      ]
+      for (const thrown of odd) {
+        const [a, b] = await Promise.all(['a', 'b'].map((x) => make(email(x), 'member')))
+        answers.event = (e) => {
+          if (e.type === 'link-requested') throw thrown()
+        }
+        events.length = 0
+        const token = tokenFrom((await ask(a!, b!.email!)).mail.find((m) => m.to === 'other')!.text)
+        expect((await call('/hats/confirm', null, { token })).status).toBe(200)
+        expect(events.map((e) => e.type)).toEqual(['link-requested', 'link-confirmed'])
+      }
+      const names = logged.map((l) => /\(([^)]*)\)$/.exec(String((l as [{ msg: string }])[0].msg))?.[1])
+      expect(names).toEqual(['Error', 'Error', 'Error', 'string'])
+      expect(JSON.stringify(logged)).not.toMatch(/made-up|@example\.invalid|XXXX/)
+    } finally {
+      payload.logger.error = error
+    }
+  })
+
+  it('answers the confirm page within about two seconds when the site’s handlers never finish', async () => {
+    const warned: unknown[] = []
+    const warn = payload.logger.warn.bind(payload.logger)
+    payload.logger.warn = ((...args: unknown[]) => void warned.push(args)) as never
+    try {
+      const [a, b] = await Promise.all(['a', 'b'].map((x) => make(email(x), 'member')))
+      const token = tokenFrom((await ask(a!, b!.email!)).mail.find((m) => m.to === 'other')!.text)
+      answers.event = (e) => (e.type === 'link-confirmed' ? new Promise(() => {}) : undefined)
+      const started = Date.now()
+      const res = await call('/hats/confirm', null, { token })
+      const took = Date.now() - started
+      expect(res.status).toBe(200)
+      expect(took).toBeLessThan(3500)
+      expect(took).toBeGreaterThanOrEqual(1900)
+      expect((await payload.count({ collection: MEMBERS as never, where: { user: { in: [a!.id, b!.id] } }, overrideAccess: true })).totalDocs).toBe(2)
+      expect(JSON.stringify(warned)).toMatch(/still running/)
+    } finally {
+      payload.logger.warn = warn
+    }
+  }, 15_000)
+
+  it('runs the site’s confirmURL and onEvent callbacks without the plugin’s mark on the request', async () => {
+    const seen: [string, boolean][] = []
+    answers.confirmURL = ({ req, token }) => {
+      seen.push(['confirmURL', isInternal(req)])
+      return `https://site.example/api/hats/confirm?token=${token}`
+    }
+    answers.event = (e) => {
+      if ('req' in e) seen.push([e.type, isInternal(e.req)])
+    }
+    const [a, b, c] = await Promise.all(['a', 'b', 'c'].map((x) => make(email(x), 'member')))
+    const token = tokenFrom((await ask(a!, b!.email!)).mail.find((m) => m.to === 'other')!.text)
+    expect((await call('/hats/confirm', null, { token })).status).toBe(200) // mails the asker a link of its own
+    expect((await ask(a!, c!.email!)).status).toBe(202) // from a set: link-requested fires at ask time
+    expect(seen.map(([k]) => k)).toEqual(['confirmURL', 'confirmURL', 'link-requested', 'confirmURL', 'link-requested'])
+    expect(seen.every(([, marked]) => marked === false)).toBe(true)
   })
 
   it('ignores a string marker in context: server code can’t pass as the plugin', async () => {

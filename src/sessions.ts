@@ -1,6 +1,6 @@
 import type { AuthStrategy, Payload, PayloadRequest, Where } from 'payload'
 
-import { asPlugin, attachState, DISSOLVING, hatsOptions, idOf, withMark } from './state.js'
+import { asPlugin, attachState, DISSOLVING, hatsOptions, idOf, unmarked, withMark } from './state.js'
 import { LINKS, MEMBERS, SESSIONS, type Hat, type HatsState, type HatsUser, type ResolvedHatsOptions } from './types.js'
 
 type SessionDoc = { id: string; sid: string; user: string; via?: string | null; link?: string | null; hat?: string | null; steppedUp?: Record<string, string> | null; revokedAt?: string | null; expiresAt?: string | null }
@@ -38,7 +38,8 @@ export async function revokeSessions(payload: Payload, where: Where, reason: str
     await revokeSid(payload, s.user, s.sid, req)
     await tombstone(payload, s.id, req)
   }
-  if (docs.length) await hatsOptions(payload).onEvent?.({ type: 'sessions-revoked', payload, sessions: docs.length, reason })
+  // This can run inside the plugin's own writes (an unlink, a set dissolving), so the site's handler runs unmarked.
+  if (docs.length) await unmarked(req, () => hatsOptions(payload).onEvent?.({ type: 'sessions-revoked', payload, sessions: docs.length, reason }))
   return docs.length
 }
 

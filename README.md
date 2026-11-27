@@ -115,10 +115,12 @@ export async function POST(request: Request) {
 Sets already approved keep working, and requests still pending from 0.4.0 complete through their old links with the same confirmations and approval. To upgrade:
 
 1. Regenerate types with `payload generate:types` (new `hat-requests` collection). MongoDB needs nothing more, unless Mongoose's `autoIndex` is off: then build the collection's indexes, including the unique one on `holds`.
-2. On Postgres or SQLite, add the table, with its unique `holds` column, through `payload migrate:create`, then `payload migrate`.
+2. On Postgres or SQLite, add the `hat_requests` table, with its unique `holds` column, through `payload migrate:create`, then `payload migrate`. No existing table changes. Linking didn't work on SQL databases in 0.4.0 (ids were written as strings); it does now.
 3. Review a custom `reasons.linkSent` text: it shouldn't name the address. Link requests now answer 202 after `linkAnswerMs`.
-4. In an `onEvent` handler, use `by` for the asker on `link-requested`. It fires at ask time only when the asker is already in a set. Otherwise it fires as the other account confirms, just before `link-confirmed`, on that request: `req.user` there may be nobody, or the invited person, who may be a child. A handler that throws during a confirmation is logged and skipped, and the confirmation still completes.
+4. In an `onEvent` handler, use `by` for the asker on `link-requested`. It fires at ask time only when the asker is already in a set. Otherwise it fires as the other account confirms, just before `link-confirmed`, on that request: `req.user` there may be nobody, or the invited person, who may be a child. A handler that throws during a confirmation is logged by a short error name and skipped, and the confirmation still completes. The page waits at most 2 seconds for each link event's handler. `confirmURL`, `sendEmail` and `onEvent` run without the plugin's mark on the request, so their writes are checked like any other.
 5. Key `limit` by address as well as person.
+
+Limits to know about: with `autoIndex` off and no `holds` index, requests arriving together can each send an invitation. Don't call the link endpoint's handler inside a transaction your own code opened: a refused claim ends it. Anyone signed in can hold an account's one open invitation until it expires (`confirmHours`), which delays other invitations to that account.
 
 The changelog lists every change.
 

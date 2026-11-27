@@ -2,6 +2,13 @@
 
 Newest first.
 
+## 2026-11-27 (review round three): number ids, SQL deletes, handler bounds, the mark on callbacks
+
+- New promises: relationships hold the account's own id type; deleting an account works on SQL; a link event handler can't hang or 500 the confirm page; host callbacks never see the plugin's mark.
+- Covered: `test/numeric-ids.test.ts` (number-id users on in-memory MongoDB: request, both confirmations, the set and an account delete, plus `relId`); in `test/hats.test.ts`, "a handler’s error has a name that throws", "handlers never finish", "without the plugin’s mark". The whole main suite also ran once by hand on SQLite (`HATS_DB=sqlite`), 79 passing, the MongoDB write-count test skipped.
+- Fixed: the flaky timing test now waits for the request's background work (`linkWorkSettled`), no longer a sleep.
+- Gaps skipped: Postgres and `payload migrate:create` (no server here; SQLite covers the id type and foreign keys); a startup check for the `holds` index with `autoIndex` off and calls inside a caller's transaction (documented limits, no code to test); a stranger holding an invitation (unchanged behavior, documented).
+
 ## 2026-11-27 (review round two): concurrent requests, failing handlers, the plugin's mark
 
 Suite: 135 tests before, 138 after (same setup).

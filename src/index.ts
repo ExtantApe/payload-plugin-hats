@@ -1,9 +1,9 @@
-import type { PayloadRequest, CollectionAfterChangeHook, CollectionAfterDeleteHook, CollectionAfterLogoutHook, Config, Plugin } from 'payload'
+import type { PayloadRequest, CollectionAfterChangeHook, CollectionAfterDeleteHook, CollectionBeforeDeleteHook, CollectionAfterLogoutHook, Config, Plugin } from 'payload'
 
 import { hatCollections } from './collections.js'
 import { hatEndpoints, runSwitch, type SwitchInput, type SwitchResult } from './endpoints.js'
 import { revokeSessions, wrapStrategies } from './sessions.js'
-import { asPlugin, newToken } from './state.js'
+import { asPlugin, newToken, relId } from './state.js'
 import { MEMBERS, REQUESTS, SESSIONS, type HatsOptions, type HatsUser, type ResolvedHatsOptions } from './types.js'
 
 export { hatsStateOf } from './state.js'
@@ -58,15 +58,20 @@ export const hats =
       if ([...ids(previousDoc)].some((h) => !now.has(h))) await revokeSessions(req.payload, { and: [{ user: { equals: String(doc.id) } }, { via: { exists: true } }, { via: { not_equals: null } }] }, 'lost a role', req)
       return doc
     }
-    const afterDelete: CollectionAfterDeleteHook = async ({ id, req }) => {
-      await revokeSessions(req.payload, { or: [{ user: { equals: String(id) } }, { via: { equals: String(id) } }] }, 'account deleted', req)
+    // Rows that point at the account go before the account does. On SQL databases the foreign keys would otherwise set
+    // them to null first, which the required columns refuse, so the delete failed. Inside the delete's transaction.
+    const beforeDelete: CollectionBeforeDeleteHook = async ({ id, req }) => {
+      const me = relId(req.payload, opts.users, id)
       await asPlugin(req, async () => {
-        await req.payload.delete({ collection: MEMBERS as never, where: { user: { equals: String(id) } }, overrideAccess: true, req })
-        await req.payload.delete({ collection: REQUESTS as never, where: { requestedBy: { equals: String(id) } }, overrideAccess: true, req })
+        await req.payload.delete({ collection: MEMBERS as never, where: { user: { equals: me } }, overrideAccess: true, req })
+        await req.payload.delete({ collection: REQUESTS as never, where: { requestedBy: { equals: me } }, overrideAccess: true, req })
         // Requests to the account stay, emptied, until they expire: they still count toward the asker's limit, so
         // deleting an account frees nothing the asker could notice. At most one request holds the account.
-        await req.payload.update({ collection: REQUESTS as never, where: { account: { equals: String(id) } }, data: { account: null, holds: `none:${newToken()}`, tokenHash: null } as never, overrideAccess: true, req })
+        await req.payload.update({ collection: REQUESTS as never, where: { account: { equals: me } }, data: { account: null, holds: `none:${newToken()}`, tokenHash: null } as never, overrideAccess: true, req })
       })
+    }
+    const afterDelete: CollectionAfterDeleteHook = async ({ id, req }) => {
+      await revokeSessions(req.payload, { or: [{ user: { equals: String(id) } }, { via: { equals: String(id) } }] }, 'account deleted', req)
     }
     const afterLogout: CollectionAfterLogoutHook = async ({ req }) => {
       const sid = (req.user as HatsUser | null)?._sid
@@ -84,6 +89,7 @@ export const hats =
                 hooks: {
                   ...c.hooks,
                   afterChange: [...(c.hooks?.afterChange ?? []), afterChange],
+                  beforeDelete: [...(c.hooks?.beforeDelete ?? []), beforeDelete],
                   afterDelete: [...(c.hooks?.afterDelete ?? []), afterDelete],
                   afterLogout: [...(c.hooks?.afterLogout ?? []), afterLogout],
                 },

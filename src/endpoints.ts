@@ -4,7 +4,7 @@ import { addSessionToUser, generateCookie } from 'payload/shared'
 import { blockedBy, exactlyTrue } from './access.js'
 import { cleanupSessions, revokeSessions, revokeSid, sessionBySid, sharedLink, tombstone, wornHat } from './sessions.js'
 import { memoryKey, needsStepUp, remembered } from './stepup.js'
-import { asPlugin, DISSOLVING, hashToken, hatsOptions, hatsStateOf, idOf, newToken, withMark } from './state.js'
+import { asPlugin, DISSOLVING, hashToken, hatsOptions, hatsStateOf, idOf, newToken, relId, trackWork, unmarked, withMark } from './state.js'
 import { LINKS, MEMBERS, REQUESTS, SESSIONS, type Hat, type HatsEvent, type HatsUser, type ResolvedHatsOptions } from './types.js'
 
 const json = (body: unknown, status = 200, cookies: string[] = []) => {
@@ -295,8 +295,8 @@ const expiry = (seconds: number) => new Date(Date.now() + seconds * 1000).toISOS
 const SENT =
   'If that address belongs to an account that can be linked, we’ve emailed it a link to confirm. Once it’s confirmed, we’ll email you to confirm from your side, and then an administrator reviews the link.'
 
-const confirmLink = (req: PayloadRequest, opts: ResolvedHatsOptions, token: string) =>
-  opts.confirmURL ? opts.confirmURL({ req, token }) : `${new URL(req.url ?? 'http://localhost').origin}${req.payload.config.routes.api}/hats/confirm?token=${token}`
+const confirmLink = async (req: PayloadRequest, opts: ResolvedHatsOptions, token: string) =>
+  opts.confirmURL ? String(await unmarked(req, () => opts.confirmURL!({ req, token }))) : `${new URL(req.url ?? 'http://localhost').origin}${req.payload.config.routes.api}/hats/confirm?token=${token}`
 
 /** Open link requests one account may have at once. Counted the same whatever the addresses were. */
 const pendingCap = (opts: ResolvedHatsOptions) => opts.maxLinked * 2
@@ -315,10 +315,35 @@ const holdFor = (account: HatsUser | null) => (account ? `account:${String(accou
  * only (a message can carry what the event was about) and skipped, so the person confirming still gets their page.
  */
 async function tell(req: PayloadRequest, opts: ResolvedHatsOptions, event: HatsEvent) {
+  if (!opts.onEvent) return
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const late = new Promise<'late'>((resolve) => {
+    timer = setTimeout(() => resolve('late'), TELL_MS)
+  })
+  const run = unmarked(req, () => opts.onEvent!(event)).then(
+    () => 'ok' as const,
+    (error: unknown) => {
+      req.payload.logger.error({ msg: `Hats: an onEvent handler failed on ${event.type} (${safeName(error)})` })
+      return 'failed' as const
+    },
+  )
   try {
-    await opts.onEvent?.(event)
-  } catch (error) {
-    req.payload.logger.error({ msg: `Hats: an onEvent handler failed on ${event.type} (${(error as Error | undefined)?.name ?? typeof error})` })
+    if ((await Promise.race([run, late])) === 'late') req.payload.logger.warn({ msg: `Hats: an onEvent handler on ${event.type} is still running; the page didn't wait for it` })
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** The longest a link request or confirmation waits for the site's `onEvent` handler; it carries on unwaited after. */
+const TELL_MS = 2000
+
+/** An error's name for the log, only when it's a short plain word; anything else, or a name that throws, is `Error`. */
+function safeName(error: unknown): string {
+  try {
+    const name = (error as { name?: unknown } | null | undefined)?.name
+    return typeof name === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,39}$/.test(name) ? name : typeof error === 'object' && error ? 'Error' : typeof error
+  } catch {
+    return 'Error'
   }
 }
 
@@ -369,7 +394,7 @@ const requestLink: Endpoint = {
       const request = (await asPlugin(req, () =>
         req.payload.create({
           collection: REQUESTS as never,
-          data: { requestedBy: me, account: null, holds: hold, tokenHash: hashToken(token), expiresAt: new Date(now.getTime() + hours * 3_600_000).toISOString(), link: mine ? idOf(mine.link) : null } as never,
+          data: { requestedBy: relId(req.payload, opts.users, full.id), account: null, holds: hold, tokenHash: hashToken(token), expiresAt: new Date(now.getTime() + hours * 3_600_000).toISOString(), link: mine ? idOf(mine.link) : null } as never,
           overrideAccess: true,
           req,
         }),
@@ -378,7 +403,7 @@ const requestLink: Endpoint = {
       // rule: `holds` is unique, so of requests arriving together only one can claim the account. Every request makes
       // the same two writes (a request with no account to claim rewrites its own hold), and any failure to claim
       // means no invitation, so the asker sees the same thing either way.
-      const claim = target ? { account: target.id, holds: holdFor(target) } : { holds: hold }
+      const claim = target ? { account: relId(req.payload, opts.users, target.id), holds: holdFor(target) } : { holds: hold }
       const claimed = await asPlugin(req, () => req.payload.update({ collection: REQUESTS as never, id: request.id, data: claim as never, overrideAccess: true, req })).then(
         () => true,
         () => false,
@@ -401,7 +426,7 @@ const requestLink: Endpoint = {
           payload: req.payload,
           to: String(target.email),
           subject: 'Confirm linking your accounts',
-          text: `Someone signed in as ${labelOf(full)} asked to link that account with ${labelOf(target)}, so one person can switch between them.\n\nIf that was you, confirm here within ${hours} hours:\n${confirmLink(req, opts, token)}\n\nIf it wasn’t you, ignore this email: nothing is linked without it.`,
+          text: `Someone signed in as ${labelOf(full)} asked to link that account with ${labelOf(target)}, so one person can switch between them.\n\nIf that was you, confirm here within ${hours} hours:\n${await confirmLink(req, opts, token)}\n\nIf it wasn’t you, ignore this email: nothing is linked without it.`,
         })
       } catch (err) {
         // The invitation never arrived, so its token must never work.
@@ -418,6 +443,7 @@ const requestLink: Endpoint = {
       .finally(() => {
         finished = true
       })
+    trackWork(done)
     await answer
     if (!finished) void done.then(() => req.payload.logger.info('Hats: a link request finished after its answer. Raise linkAnswerMs if this repeats.'))
     return json({ ok: true, reason: 'linkSent', message: SENT }, 202)
@@ -503,15 +529,15 @@ const confirm: Endpoint = {
     }
     if (existing && (await members(req, existing)).length + 1 > opts.maxLinked) return bad()
 
-    const made: { link?: string; rows: string[] } = { rows: [] }
+    const made: { link?: string; rows: string[]; own?: string } = { rows: [] }
     try {
       await asPlugin(req, async () => {
-        const link = existing ?? String((await req.payload.create({ collection: LINKS as never, data: { requestedBy: by, label: `Started by ${labelOf(asker)}` } as never, overrideAccess: true, req })).id)
+        const link = existing ?? String((await req.payload.create({ collection: LINKS as never, data: { requestedBy: relId(req.payload, opts.users, by), label: `Started by ${labelOf(asker)}` } as never, overrideAccess: true, req })).id)
         if (!existing) made.link = link
         const now = new Date()
         const row = await req.payload.create({
           collection: MEMBERS as never,
-          data: { link, user: account, status: 'confirmed', confirmedAt: now.toISOString(), addedBy: by } as never,
+          data: { link: relId(req.payload, LINKS, link), user: relId(req.payload, opts.users, account), status: 'confirmed', confirmedAt: now.toISOString(), addedBy: relId(req.payload, opts.users, by) } as never,
           overrideAccess: true,
           req,
         })
@@ -522,19 +548,25 @@ const confirm: Endpoint = {
           const hours = opts.confirmHours
           const ownRow = await req.payload.create({
             collection: MEMBERS as never,
-            data: { link, user: by, status: 'requested', tokenHash: hashToken(own), tokenExpires: new Date(now.getTime() + hours * 3_600_000).toISOString(), addedBy: by } as never,
+            data: { link: relId(req.payload, LINKS, link), user: relId(req.payload, opts.users, by), status: 'requested', tokenHash: hashToken(own), tokenExpires: new Date(now.getTime() + hours * 3_600_000).toISOString(), addedBy: relId(req.payload, opts.users, by) } as never,
             overrideAccess: true,
             req,
           })
           made.rows.push(String(ownRow.id))
-          await opts.sendEmail({
-            payload: req.payload,
-            to: String(asker.email),
-            subject: 'Confirm linking your accounts',
-            text: `${labelOf(invited)} agreed to link with ${labelOf(asker)}, so one person can switch between them.\n\nConfirm from your side here within ${hours} hours:\n${confirmLink(req, opts, own)}\n\nIf you didn’t ask for this, ignore this email: nothing is linked without it.`,
-          })
+          made.own = own
         }
       })
+      // The site's own callbacks run after the plugin's writes, with its mark off the request.
+      if (made.own) {
+        const own = made.own
+        const hours = opts.confirmHours
+        await opts.sendEmail({
+          payload: req.payload,
+          to: String(asker.email),
+          subject: 'Confirm linking your accounts',
+          text: `${labelOf(invited)} agreed to link with ${labelOf(asker)}, so one person can switch between them.\n\nConfirm from your side here within ${hours} hours:\n${await confirmLink(req, opts, own)}\n\nIf you didn’t ask for this, ignore this email: nothing is linked without it.`,
+        })
+      }
     } catch (error) {
       // Someone linked one of these accounts a moment ago, or the email didn't go: undo what this made.
       req.payload.logger.warn({ err: error }, 'Hats: link confirmation not recorded')

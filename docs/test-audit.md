@@ -55,3 +55,9 @@ All in `test/hats.test.ts`, against a real Payload 3.92 on an in-memory MongoDB 
   - axe: 0 on the plugin's parts. Fixed on the way: dark-mode contrast, the code wording when acting through another account, the panel's wrapping in the admin header, and a readable set title instead of an id.
   - Payload's own form widgets (react-select, date picker, field descriptions) show axe findings on every collection; not ours.
 - Not tested: a real screen reader, real email delivery.
+
+## 2026-11-26: switchSession
+
+- New promises: one shared switch for the endpoint and `switchSession`; acts only for `req.user`; no check can be skipped; hook errors refuse; one code covers the set for `rememberMinutes`; going down to the signed-in account needs no code.
+- Covered in `test/hats.test.ts` ("switchSession and the endpoint share one switch", "a gain-based stepUpWhen across a person's set"): every refusal (blocked, notLinked, notAvailable, chooseHat, needsCode, wrongCode, setUpTwoStep, noSecondFactor) gives the same status and reason through both, and passes with the guard lifted; no user and no session state; same cookie attributes and session effects; the same-origin POST rule (a GET, a missing method, a foreign Origin, cross-site and same-site Sec-Fetch-Site, plain-object headers and no headers all refused as `notPost` or `crossSite`; the site's own origin passes); a locked account refused as `locked`, and an unverified one as `unverified` when the collection verifies emails; a user from another collection refused on its own; ignored skip options; throwing verify, available, blocked, stepUpWhen, showSwitch, hatsOf; expiry at 179 and 181 minutes and a 30-minute setting; per-account memory; blocked and unlink while switched.
+- Gaps skipped: a real browser and Origin behind a proxy that rewrites the URL (requests are built by hand); a throwing `onEvent` (reported as a failed switch after the session moved; an audit hook that throws is the site's bug).

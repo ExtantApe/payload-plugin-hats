@@ -3,7 +3,7 @@ import { MongoMemoryReplSet } from 'mongodb-memory-server'
 import { buildConfig, createLocalReq, createPayloadRequest, getPayload, type SanitizedConfig, type Endpoint, type Payload, type PayloadRequest } from 'payload'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 
-import { applyHat, cleanupSessions, hats, hatsStateOf, MEMBERS, SESSIONS, type Hat, type HatsEvent, type HatsUser } from '../src/index.js'
+import { applyHat, cleanupSessions, hats, hatsStateOf, MEMBERS, SESSIONS, switchSession, type Hat, type HatsEvent, type HatsUser } from '../src/index.js'
 import type { ResolvedHatsOptions } from '../src/types.js'
 
 /**
@@ -53,6 +53,7 @@ async function call(path: string, token: string | null, body: unknown = {}, meth
   const req = (await createLocalReq({ user: (user ?? undefined) as never }, payload)) as PayloadRequest
   if (!user) req.user = null
   ;(req as { headers: Headers }).headers = new Headers({ 'content-type': 'application/json' })
+  ;(req as { method: string }).method = 'POST'
   ;(req as { url: string }).url = `https://site.example/api${path}`
   req.data = body as never
   ;(req as unknown as { json: () => Promise<unknown> }).json = async () => body
@@ -105,6 +106,7 @@ beforeAll(async () => {
             { name: 'maintainer', type: 'checkbox' },
             { name: 'code', type: 'text' },
             { name: 'disabled', type: 'checkbox' },
+            { name: '_verified', type: 'checkbox', admin: { hidden: true } }, // what Payload adds when auth.verify is on; the test turns that on by hand
           ],
         },
         { slug: 'secrets', access: { read: ({ req }) => (req.user as U | null)?.level === 'admin' }, fields: [{ name: 'text', type: 'text' }] },
@@ -783,5 +785,445 @@ describe('stepUpWhen and remembering per set', () => {
     await call('/hats/switch', token, { hat: 'admin' }) // remembered
     const sw = events.filter((e) => e.type === 'switched') as Extract<HatsEvent, { type: 'switched' }>[]
     expect(sw.map((e) => e.steppedUp)).toEqual([false, true, false, false])
+  })
+})
+
+describe('switchSession and the endpoint share one switch', () => {
+  const LIVE = () => payload.config.custom!.hats as Record<string, any>
+  /** A request as a site's own route would hold it: the signed-in user from Payload's auth, nothing else. */
+  async function reqFor(token: string | null, body: unknown = {}) {
+    const user = token ? await whoIs(token) : null
+    const req = (await createLocalReq({ user: (user ?? undefined) as never }, payload)) as PayloadRequest
+    if (!user) req.user = null
+    ;(req as { headers: Headers }).headers = new Headers({ 'content-type': 'application/json' })
+    ;(req as { url: string }).url = 'https://site.example/api/hats/switch'
+    ;(req as { method: string }).method = 'POST'
+    req.data = body as never
+    return req
+  }
+  const viaEndpoint = async (token: string | null, body: Record<string, unknown>) => {
+    const req = await reqFor(token, body)
+    try {
+      const res = await endpoint('/hats/switch', 'post').handler(req)
+      const json = JSON.parse(await res.text())
+      return { ok: res.status === 200, status: res.status, reason: json.reason as string | undefined, cookie: res.headers.getSetCookie().find((c) => c.startsWith('payload-token=')) ?? null }
+    } catch (e) {
+      return { ok: false, status: (e as { status: number }).status, reason: (e as { data?: { reason?: string } }).data?.reason, cookie: null }
+    }
+  }
+  const viaFunction = async (token: string | null, body: Record<string, unknown>) => {
+    const r = await switchSession(await reqFor(token), body as never)
+    return r.ok ? { ok: true, status: 200, reason: undefined, cookie: r.cookie, result: r } : { ok: false, status: r.status, reason: r.reason, cookie: null, result: r }
+  }
+  /** Cookie attributes with the value and expiry taken out, since both differ on every call. */
+  const attrs = (c: string | null) => c?.split(';').map((p) => p.trim()).filter((p) => !p.toLowerCase().startsWith('expires=')).map((p, i) => (i === 0 ? 'payload-token' : p)).join('; ')
+  const tokenOf = (cookie: string | null) => cookie!.split(';')[0]!.slice('payload-token='.length)
+  const both = async (mk: () => Promise<string | null>, body: Record<string, unknown>) => ({ e: await viaEndpoint(await mk(), body), f: await viaFunction(await mk(), body) })
+  async function pair2() {
+    const approver = await make(email('maint'), 'admin', { maintainer: true })
+    const a = await make(email('a'), 'admin', { code: '333333' })
+    const b = await make(email('b'), 'curator', { code: '444444' })
+    await link(a, b, approver)
+    return { a, b }
+  }
+
+  describe('refuses a switch that did not come from the site\'s own POST', () => {
+    const cases: [string, { method?: string; headers?: Record<string, string> }, string][] = [
+      ['a GET', { method: 'GET' }, 'notPost'],
+      ['a missing method', { method: '' }, 'notPost'],
+      ['a foreign Origin', { headers: { origin: 'https://evil.example' } }, 'crossSite'],
+      ['a cross-site Sec-Fetch-Site', { headers: { 'sec-fetch-site': 'cross-site' } }, 'crossSite'],
+      ['a same-site (sibling) Sec-Fetch-Site', { headers: { 'sec-fetch-site': 'same-site' } }, 'crossSite'],
+      ['a GET with a foreign Origin and cross-site Sec-Fetch-Site', { method: 'GET', headers: { origin: 'https://evil.example', 'sec-fetch-site': 'cross-site' } }, 'notPost'],
+    ]
+    for (const [name, mod, reason] of cases)
+      it(`${name}`, async () => {
+        const admin = await make(email('admin'), 'admin')
+        const token = await login(admin.email!)
+        const req = await reqFor(token)
+        ;(req as { method: string }).method = mod.method ?? 'POST'
+        for (const [k, v] of Object.entries(mod.headers ?? {})) req.headers.set(k, v)
+        const r = await switchSession(req, { hat: 'member' })
+        expect(r).toMatchObject({ ok: false, reason })
+        expect((await whoIs(token))!.level).toBe('admin') // nothing switched
+      })
+    it('lets the site\'s own origin and a same-origin Sec-Fetch-Site through', async () => {
+      const admin = await make(email('admin'), 'admin')
+      const req = await reqFor(await login(admin.email!))
+      req.headers.set('origin', 'https://site.example')
+      req.headers.set('sec-fetch-site', 'same-origin')
+      expect(await switchSession(req, { hat: 'member' })).toMatchObject({ ok: true })
+    })
+  })
+
+  it('refuses an account that is locked, and lets it in once the lock has passed', async () => {
+    const { a, b } = await pair2()
+    await payload.update({ collection: 'users', id: b.id, data: { lockUntil: new Date(Date.now() + 600_000).toISOString() } as never, overrideAccess: true, showHiddenFields: true } as never)
+    const locked = await both(() => login(a.email!), { account: b.id, hat: 'curator', code: '444444' })
+    for (const r of [locked.e, locked.f]) expect([r.ok, r.status, r.reason]).toEqual([false, 403, 'locked'])
+    await payload.update({ collection: 'users', id: b.id, data: { lockUntil: new Date(Date.now() - 1000).toISOString() } as never, overrideAccess: true, showHiddenFields: true } as never)
+    expect((await viaFunction(await login(a.email!), { account: b.id, hat: 'curator', code: '444444' })).ok).toBe(true)
+  })
+
+  it('refuses when the headers are a plain object with a foreign Origin, and when there are no headers at all', async () => {
+    const admin = await make(email('admin'), 'admin')
+    const token = await login(admin.email!)
+    const bad = await reqFor(token)
+    ;(bad as { headers: unknown }).headers = { Origin: 'https://evil.example', 'Sec-Fetch-Site': 'cross-site' }
+    expect(await switchSession(bad, { hat: 'member' })).toMatchObject({ ok: false, reason: 'crossSite' })
+    const none = await reqFor(token)
+    ;(none as { headers: unknown }).headers = undefined
+    expect(await switchSession(none, { hat: 'member' })).toMatchObject({ ok: false, reason: 'crossSite' })
+    expect((await whoIs(token))!.level).toBe('admin')
+    const fine = await reqFor(token)
+    ;(fine as { headers: unknown }).headers = { origin: 'https://site.example' }
+    expect(await switchSession(fine, { hat: 'member' })).toMatchObject({ ok: true })
+  })
+
+  it('treats headers that are not a Headers instance or a plain object as cross-site', async () => {
+    const admin = await make(email('admin'), 'admin')
+    const token = await login(admin.email!)
+    const odd: unknown[] = [[['origin', 'https://site.example']], new Map([['origin', 'https://site.example']]), { get: () => undefined }, 'origin: x', 5]
+    for (const headers of odd) {
+      const req = await reqFor(token)
+      ;(req as { headers: unknown }).headers = headers
+      // the Map and the array are refused outright; a class instance with a get() is not trusted either
+      expect(await switchSession(req, { hat: 'member' })).toMatchObject({ ok: false, reason: 'crossSite' })
+    }
+    expect((await whoIs(token))!.level).toBe('admin')
+  })
+
+  it('refuses an unverified account when the collection verifies emails, and lets it in once verified', async () => {
+    const { a, b } = await pair2()
+    const auth = payload.collections.users!.config.auth as { verify: unknown }
+    const saved = auth.verify
+    try {
+      auth.verify = true
+      await payload.update({ collection: 'users', id: a.id, data: { _verified: true } as never, overrideAccess: true, showHiddenFields: true } as never)
+      await payload.update({ collection: 'users', id: b.id, data: { _verified: false } as never, overrideAccess: true, showHiddenFields: true } as never)
+      const r = await both(() => login(a.email!), { account: b.id, hat: 'curator', code: '444444' })
+      for (const x of [r.e, r.f]) expect([x.ok, x.status, x.reason]).toEqual([false, 403, 'unverified'])
+      await payload.update({ collection: 'users', id: b.id, data: { _verified: true } as never, overrideAccess: true, showHiddenFields: true } as never)
+      expect((await viaFunction(await login(a.email!), { account: b.id, hat: 'curator', code: '444444' })).ok).toBe(true)
+    } finally {
+      auth.verify = saved
+    }
+  })
+
+  it('refuses a request whose user is from another collection even with a valid session state', async () => {
+    const admin = await make(email('admin'), 'admin')
+    const token = await login(admin.email!)
+    const req = await reqFor(token)
+    expect(hatsStateOf(req.user as never)).toBeTruthy() // the state is there, so only the collection check can refuse
+    ;(req.user as { collection: string }).collection = 'staff'
+    expect(await switchSession(req, { hat: 'member' })).toMatchObject({ ok: false, status: 401, reason: 'signIn' })
+    expect((await whoIs(token))!.level).toBe('admin')
+  })
+
+  it('is refused with no one signed in, and by an account that is not from the hats collection', async () => {
+    const e = await viaEndpoint(null, { hat: 'member' })
+    const f = await viaFunction(null, { hat: 'member' })
+    expect([e.ok, e.status, e.reason]).toEqual([false, 401, 'signIn'])
+    expect([f.ok, f.status, f.reason]).toEqual([false, 401, 'signIn'])
+    // A user that exists but not as a browser sign-in (no session state) is refused the same way.
+    const u = await make(email('admin'), 'admin')
+    const req = await reqFor(null)
+    req.user = { ...u, collection: 'users' } as never
+    const r = await switchSession(req, { hat: 'member' })
+    expect(r).toMatchObject({ ok: false, status: 400, reason: 'signIn' })
+  })
+
+  it('never throws for a refusal, and acts only for req.user (the input names no other person)', async () => {
+    const admin = await make(email('admin'), 'admin')
+    const other = await make(email('other'), 'admin')
+    const token = await login(admin.email!)
+    const r = await switchSession(await reqFor(token), { hat: 'member', user: other.id, as: other.id } as never)
+    expect(r).toMatchObject({ ok: true, account: String(admin.id), hat: 'member', cookie: null })
+    expect((await whoIs(token))!.level).toBe('member')
+    const otherToken = await login(other.email!)
+    expect((await whoIs(otherToken))!.level).toBe('admin') // untouched
+  })
+
+  it('gives every refusal the same status and reason as the endpoint, and passes once the guard is lifted', async () => {
+    const { a, b } = await pair2()
+    const outsider = await make(email('out'), 'admin', { code: '999999' })
+    const member = await make(email('mem'), 'member')
+    const opts = LIVE()
+    const t = async (u: U) => login(u.email!)
+    const stepDown = async (u: U) => {
+      const tk = await login(u.email!)
+      await call('/hats/switch', tk, { hat: 'member' })
+      return tk
+    }
+    type Case = { name: string; mk: () => Promise<string | null>; body: () => Record<string, unknown>; expectStatus: number; expectReason: string; lift: () => () => void; liftedBody?: () => Record<string, unknown> }
+    const cases: Case[] = [
+      { name: 'blocked', mk: () => t(a), body: () => ({ hat: 'member' }), expectStatus: 409, expectReason: 'blocked', lift: () => ((answers.blocked = () => 'Stop masquerading first.'), () => void (answers.blocked = undefined)) },
+      { name: 'notLinked', mk: () => t(a), body: () => ({ account: outsider.id, hat: 'admin' }), expectStatus: 403, expectReason: 'notLinked', lift: () => () => {} },
+      { name: 'notAvailable', mk: () => t(member), body: () => ({ hat: 'member' }), expectStatus: 403, expectReason: 'notAvailable', lift: () => () => {} },
+      { name: 'chooseHat', mk: () => t(a), body: () => ({ hat: 'nonsense' }), expectStatus: 400, expectReason: 'chooseHat', lift: () => () => {} },
+      { name: 'needsCode', mk: () => stepDown(a), body: () => ({ hat: 'admin' }), expectStatus: 401, expectReason: 'needsCode', lift: () => () => {}, liftedBody: () => ({ hat: 'admin', code: '333333' }) },
+      { name: 'wrongCode', mk: () => stepDown(a), body: () => ({ hat: 'admin', code: '000000' }), expectStatus: 403, expectReason: 'wrongCode', lift: () => () => {}, liftedBody: () => ({ hat: 'admin', code: '333333' }) },
+      { name: 'setUpTwoStep', mk: () => stepDown(a), body: () => ({ hat: 'admin', code: '333333' }), expectStatus: 403, expectReason: 'setUpTwoStep', lift: () => ((answers.available = () => false), () => void (answers.available = undefined)), liftedBody: () => ({ hat: 'admin', code: '333333' }) },
+      { name: 'noSecondFactor', mk: () => stepDown(a), body: () => ({ hat: 'admin', code: '333333' }), expectStatus: 403, expectReason: 'noSecondFactor', lift: () => { const s = opts.stepUp; opts.stepUp = undefined; return () => void (opts.stepUp = s) } },
+    ]
+    for (const c of cases) {
+      const restore = c.lift()
+      try {
+        const { e, f } = await both(c.mk, c.body())
+        expect([e.ok, e.status, e.reason], `${c.name} endpoint`).toEqual([false, c.expectStatus, c.expectReason])
+        expect([f.ok, f.status, f.reason], `${c.name} function`).toEqual([false, c.expectStatus, c.expectReason])
+        expect((f.result as { message?: string }).message, c.name).toBeTruthy()
+      } finally {
+        restore()
+      }
+      // The other way: with the guard lifted (or the right input) the same call goes through, on both.
+      if (c.name === 'notLinked') expect((await viaFunction(await t(a), { account: b.id, hat: 'curator', code: '444444' })).ok).toBe(true)
+      else if (c.name === 'notAvailable') expect((await viaFunction(await t(a), { hat: 'member' })).ok).toBe(true)
+      else if (c.name === 'chooseHat') expect((await viaFunction(await t(a), { hat: 'author' })).ok).toBe(true)
+      else if (c.name === 'noSecondFactor') expect((await viaFunction(await stepDown(a), { hat: 'admin', code: '333333' })).ok).toBe(true)
+      else {
+        const body = c.liftedBody?.() ?? c.body()
+        const { e, f } = await both(c.mk, body)
+        expect([c.name, e.ok, f.ok]).toEqual([c.name, true, true])
+      }
+    }
+  })
+
+  it('an unavailable switch (showSwitch false) and a showSwitch that throws are both refusals, and nothing changes', async () => {
+    const admin = await make(email('admin'), 'admin')
+    const opts = LIVE()
+    const before = opts.showSwitch
+    try {
+      for (const [name, fn] of [['false', () => false], ['throws', () => { throw new Error('site store down') }]] as [string, () => boolean][]) {
+        opts.showSwitch = fn
+        const token = await login(admin.email!)
+        const e = await viaEndpoint(token, { hat: 'member' })
+        const f = await viaFunction(token, { hat: 'member' })
+        expect(e.ok, name).toBe(false)
+        expect(f.ok, name).toBe(false)
+        expect(f.status, name).toBe(name === 'false' ? 403 : 500)
+        expect((await whoIs(token))!.level, name).toBe('admin')
+      }
+    } finally {
+      opts.showSwitch = before
+    }
+    expect((await viaFunction(await login(admin.email!), { hat: 'member' })).ok).toBe(true)
+  })
+
+  it('refuses when the site hooks throw (verify, available, blocked, stepUpWhen), and never passes', async () => {
+    const a = await make(email('a'), 'admin', { code: '333333' })
+    const down = async () => {
+      const tk = await login(a.email!)
+      await call('/hats/switch', tk, { hat: 'member' })
+      return tk
+    }
+    const boom = () => { throw new Error('check store down') }
+    for (const [name, key, reason, status] of [['verify', 'verify', 'wrongCode', 403], ['available', 'available', 'setUpTwoStep', 403], ['blocked', 'blocked', 'blocked', 409]] as const) {
+      const tk = await down()
+      ;(answers as Record<string, unknown>)[key] = boom
+      try {
+        const r = await viaFunction(tk, { hat: 'admin', code: '333333' })
+        expect([name, r.ok, r.status, r.reason]).toEqual([name, false, status, reason])
+        expect((await whoIs(tk))!.level, name).toBe('member')
+      } finally {
+        ;(answers as Record<string, unknown>)[key] = undefined
+      }
+    }
+    const opts = LIVE()
+    const tk = await down()
+    opts.stepUpWhen = boom
+    try {
+      const r = await viaFunction(tk, { hat: 'admin' })
+      expect(r).toMatchObject({ ok: false, status: 401, reason: 'needsCode' })
+    } finally {
+      opts.stepUpWhen = undefined
+    }
+    // The same call with working hooks goes through.
+    expect((await viaFunction(await down(), { hat: 'admin', code: '333333' })).ok).toBe(true)
+  })
+
+  it('turns an unexpected error inside the switch into a refusal (a throwing hatsOf), never a throw or a pass', async () => {
+    const admin = await make(email('admin'), 'admin')
+    const token = await login(admin.email!)
+    const opts = LIVE()
+    const before = opts.hatsOf
+    let calls = 0
+    opts.hatsOf = (u: HatsUser) => (++calls > 1 ? (() => { throw new Error('role store down') })() : before(u))
+    try {
+      const r = await switchSession(await reqFor(token), { hat: 'member' })
+      expect(r).toMatchObject({ ok: false, status: 500, reason: 'failed' })
+    } finally {
+      opts.hatsOf = before
+    }
+    expect((await whoIs(token))!.level).toBe('admin')
+    expect((await switchSession(await reqFor(token), { hat: 'member' })).ok).toBe(true)
+  })
+
+  it('has no option that skips a check: extra input is ignored', async () => {
+    const a = await make(email('a'), 'admin', { code: '333333' })
+    const tk = await login(a.email!)
+    await call('/hats/switch', tk, { hat: 'member' })
+    const r = await switchSession(await reqFor(tk), { hat: 'admin', skipStepUp: true, force: true, trusted: true, code: undefined } as never)
+    expect(r).toMatchObject({ ok: false, reason: 'needsCode' })
+    answers.blocked = () => 'Stop masquerading first.'
+    try {
+      expect(await switchSession(await reqFor(tk), { hat: 'author', skipBlocked: true } as never)).toMatchObject({ ok: false, reason: 'blocked' })
+    } finally {
+      answers.blocked = undefined
+    }
+    expect((await whoIs(tk))!.level).toBe('member')
+  })
+
+  it('gives the same answer, the same cookie attributes and the same session effects as the endpoint', async () => {
+    const { a, b } = await pair2()
+    const mk = async () => login(a.email!)
+    const e = await viaEndpoint(await mk(), { account: b.id, hat: 'curator', code: '444444' })
+    const f = await viaFunction(await mk(), { account: b.id, hat: 'curator', code: '444444' })
+    expect([e.ok, e.status]).toEqual([true, 200])
+    expect(f.ok).toBe(true)
+    expect(e.cookie).toBeTruthy()
+    expect(attrs(f.cookie)).toBe(attrs(e.cookie))
+    expect(attrs(f.cookie)).toMatch(/HttpOnly/)
+    expect(attrs(f.cookie)).toMatch(/Path=\//)
+    expect(attrs(f.cookie)).toMatch(/SameSite=Lax/)
+    // The new session works and is b's, with the person recorded as a; the old session is gone.
+    const who = await whoIs(tokenOf(f.cookie))
+    expect(who!.id).toBe(b.id)
+    expect(hatsStateOf(who)!.via).toBe(String(a.id))
+    expect(who!.level).toBe('curator')
+    // The same hat on the same account: same answer, no cookie, from both.
+    const tkE = await login(a.email!)
+    const tkF = await login(a.email!)
+    const e2 = await viaEndpoint(tkE, { hat: 'author' })
+    const f2 = await viaFunction(tkF, { hat: 'author' })
+    expect([e2.ok, e2.cookie]).toEqual([true, null])
+    expect([f2.ok, f2.cookie]).toEqual([true, null])
+    expect((await whoIs(tkF))!.level).toBe('author')
+    // The old session of the cross-account switch no longer signs in.
+    const old = await login(a.email!)
+    const moved = await viaFunction(old, { account: b.id, hat: 'curator', code: '444444' })
+    expect(moved.ok).toBe(true)
+    expect(await whoIs(old)).toBeNull()
+  })
+
+  it('records the same events as the endpoint, with via, and returns typed account and hat', async () => {
+    events.length = 0
+    const { a, b } = await pair2()
+    const f = await viaFunction(await login(a.email!), { account: b.id, hat: 'curator', code: '444444' })
+    expect(f.result).toMatchObject({ ok: true, account: String(b.id), hat: 'curator' })
+    const sw = events.filter((e) => e.type === 'switched') as Extract<HatsEvent, { type: 'switched' }>[]
+    expect(sw.at(-1)).toMatchObject({ from: String(a.id), to: String(b.id), hat: 'curator', via: String(a.id), steppedUp: true })
+  })
+})
+
+describe('a gain-based stepUpWhen across a person\'s set', () => {
+  const PERMS: Record<string, string[]> = { member: ['read'], author: ['read', 'write'], curator: ['read', 'curate'], admin: ['read', 'write', 'curate', 'admin'] }
+  const gains = ({ from, to }: { from: { hat: string | null }; to: { hat: string } }) => PERMS[to.hat]!.some((p) => !PERMS[from.hat ?? 'admin']!.includes(p))
+  const LIVE = () => payload.config.custom!.hats as Record<string, any>
+  async function setup(extra: { rememberMinutes?: number } = {}) {
+    const opts = LIVE()
+    const saved = { stepUp: opts.stepUp, stepUpWhen: opts.stepUpWhen }
+    opts.stepUpWhen = gains
+    opts.stepUp = { ...opts.stepUp, rememberPer: 'set', ...extra }
+    const approver = await make(email('maint'), 'admin', { maintainer: true })
+    const staff = await make(email('staff'), 'member', { code: '616161' })
+    const admin = await make(email('adm'), 'admin', { code: '626262' })
+    await link(staff, admin, approver)
+    const [m] = (await payload.find({ collection: MEMBERS as never, where: { user: { equals: staff.id } }, overrideAccess: true })).docs as unknown as { link: unknown }[]
+    const setId = String(typeof m!.link === 'object' ? (m!.link as { id: unknown }).id : m!.link)
+    return { staff, admin, setId, restore: () => void Object.assign(opts, saved) }
+  }
+  const age = async (token: string, key: string, minutes: number) => {
+    const { docs } = await payload.find({ collection: SESSIONS as never, where: { sid: { equals: hatsStateOf(await whoIs(token))!.sid } }, overrideAccess: true })
+    await payload.update({ collection: SESSIONS as never, id: docs[0]!.id, data: { steppedUp: { [key]: new Date(Date.now() - minutes * 60_000).toISOString() } } as never, overrideAccess: true })
+  }
+  const sw = async (token: string, input: Record<string, unknown>) => {
+    const user = await whoIs(token)
+    const req = (await createLocalReq({ user: user as never }, payload)) as PayloadRequest
+    ;(req as { method: string }).method = 'POST'
+    return switchSession(req, input as never)
+  }
+
+  it('asks once for the set, remembers it for 180 minutes by default, then asks again; going back down never asks', async () => {
+    const { staff, admin, setId, restore } = await setup()
+    try {
+      const t = await login(staff.email!) // signed in as the member account
+      const up = await sw(t, { account: admin.id, hat: 'admin' })
+      expect(up).toMatchObject({ ok: false, reason: 'needsCode', status: 401 })
+      const into = await sw(t, { account: admin.id, hat: 'admin', code: '626262' })
+      expect(into.ok).toBe(true)
+      const t2 = (into as { cookie: string }).cookie.split(';')[0]!.slice('payload-token='.length)
+      expect(hatsStateOf(await whoIs(t2))!.via).toBe(String(staff.id))
+
+      // Down to the signed-in account: no code, and the person's own session record is kept (via).
+      const back = await sw(t2, { account: staff.id, hat: 'member' })
+      expect(back.ok).toBe(true)
+      const t3 = (back as { cookie: string }).cookie.split(';')[0]!.slice('payload-token='.length)
+      expect(hatsStateOf(await whoIs(t3))).toMatchObject({ via: null })
+      expect((await whoIs(t3))!.id).toBe(staff.id)
+      // Back up inside the window: the remembered code covers the set, so no code is asked for.
+      const again = await sw(t3, { account: admin.id, hat: 'admin' })
+      expect(again.ok).toBe(true)
+      const t4 = (again as { cookie: string }).cookie.split(';')[0]!.slice('payload-token='.length)
+      // Down a hat on the same account asks nothing either.
+      expect((await sw(t4, { hat: 'member' })).ok).toBe(true)
+      // 179 minutes old: still remembered. 181: asked again.
+      await age(t4, `set:${setId}`, 179)
+      expect((await sw(t4, { hat: 'admin' })).ok).toBe(true)
+      await sw(t4, { hat: 'member' })
+      await age(t4, `set:${setId}`, 181)
+      expect(await sw(t4, { hat: 'admin' })).toMatchObject({ ok: false, reason: 'needsCode' })
+      expect((await sw(t4, { hat: 'admin', code: '626262' })).ok).toBe(true)
+    } finally {
+      restore()
+    }
+  })
+
+  it('follows rememberMinutes, and without rememberPer: set each account asks for itself', async () => {
+    const short = await setup({ rememberMinutes: 30 })
+    try {
+      const t = await login(short.admin.email!)
+      await sw(t, { hat: 'member' })
+      expect((await sw(t, { hat: 'admin', code: '626262' })).ok).toBe(true)
+      await sw(t, { hat: 'member' })
+      await age(t, `set:${short.setId}`, 29)
+      expect((await sw(t, { hat: 'admin' })).ok).toBe(true)
+      await sw(t, { hat: 'member' })
+      await age(t, `set:${short.setId}`, 31)
+      expect(await sw(t, { hat: 'admin' })).toMatchObject({ ok: false, reason: 'needsCode' })
+    } finally {
+      short.restore()
+    }
+    const per = await setup()
+    try {
+      LIVE().stepUp.rememberPer = 'account'
+      const t = await login(per.staff.email!)
+      expect((await sw(t, { account: per.admin.id, hat: 'admin', code: '626262' })).ok).toBe(true)
+      const t2 = await login(per.admin.email!)
+      await sw(t2, { hat: 'member' })
+      // A code given on another session for the admin account is not remembered here (memory is per session).
+      expect(await sw(t2, { hat: 'admin' })).toMatchObject({ ok: false, reason: 'needsCode' })
+    } finally {
+      per.restore()
+    }
+  })
+
+  it('stops going back down the moment the link is gone or blocked() says no', async () => {
+    const { staff, admin, restore } = await setup()
+    try {
+      const t = await login(staff.email!)
+      const into = await sw(t, { account: admin.id, hat: 'admin', code: '626262' })
+      const t2 = (into as { cookie: string }).cookie.split(';')[0]!.slice('payload-token='.length)
+      answers.blocked = () => 'Stop masquerading first.'
+      try {
+        expect(await sw(t2, { account: staff.id, hat: 'member' })).toMatchObject({ ok: false, reason: 'blocked' })
+      } finally {
+        answers.blocked = undefined
+      }
+      await call('/hats/unlink', t2, { account: String(admin.id) })
+      expect(await whoIs(t2)).toBeNull() // switched sessions end with the unlink; sign in again
+    } finally {
+      restore()
+    }
   })
 })

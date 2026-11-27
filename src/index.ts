@@ -1,7 +1,7 @@
-import type { CollectionAfterChangeHook, CollectionAfterDeleteHook, CollectionAfterLogoutHook, Config, Plugin } from 'payload'
+import type { PayloadRequest, CollectionAfterChangeHook, CollectionAfterDeleteHook, CollectionAfterLogoutHook, Config, Plugin } from 'payload'
 
 import { hatCollections } from './collections.js'
-import { hatEndpoints } from './endpoints.js'
+import { hatEndpoints, runSwitch, type SwitchInput, type SwitchResult } from './endpoints.js'
 import { revokeSessions, wrapStrategies } from './sessions.js'
 import { asPlugin } from './state.js'
 import { MEMBERS, SESSIONS, type HatsOptions, type HatsUser, type ResolvedHatsOptions } from './types.js'
@@ -9,6 +9,18 @@ import { MEMBERS, SESSIONS, type HatsOptions, type HatsUser, type ResolvedHatsOp
 export { hatsStateOf } from './state.js'
 export { applyHat, cleanupSessions, revokeSessions } from './sessions.js'
 export { LINKS, MEMBERS, SESSIONS } from './types.js'
+export type { SwitchInput, SwitchResult }
+
+/**
+ * Switch the signed-in person's hat or account from a site's own route, without the picker. It runs the same code as
+ * `POST /api/hats/switch`, in the same order (blocked, notLinked, showSwitch, the step-up checks, the session record,
+ * the old session's revoke), and has no option that skips one. It acts only for `req.user`: with nobody signed in it
+ * is refused (`signIn`, 401). It never throws for a refusal. An error from a site hook is a refusal too.
+ *
+ * On `{ ok: true }` the route must send `cookie` back as `Set-Cookie`. Call it only from a same-origin POST, never
+ * from a GET: a GET can be started by a link on another site, and `SameSite=Lax` still sends the sign-in cookie on it.
+ */
+export const switchSession = (req: PayloadRequest, input: { account?: string | number | null; hat?: string; code?: string }): Promise<SwitchResult> => runSwitch(req, input)
 export type { Hat, HatsEvent, HatsOptions, HatsState, HatsUser, StepUpContext } from './types.js'
 
 /**

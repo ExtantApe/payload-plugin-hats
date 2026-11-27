@@ -1520,3 +1520,112 @@ describe('confirming a link request fails closed', () => {
     expect(await left()).toBe(0)
   })
 })
+
+describe('upgrading from 0.4.0 with linking on', () => {
+  const ctx = { hatsInternal: true }
+  /** Records exactly as 0.4.0 wrote them: a set, and a member row per account with that status (and a token while requested). */
+  async function old(people: U[], status: 'requested' | 'confirmed' | 'approved', expires = Date.now() + 3_600_000) {
+    const set = await payload.create({ collection: 'hat-links' as never, data: { requestedBy: people[0]!.id, label: `Started by ${people[0]!.email}` } as never, overrideAccess: true, context: ctx })
+    const tokens: string[] = []
+    for (const p of people) {
+      const token = `old-token-${p.id}`
+      tokens.push(token)
+      const pending = status === 'requested' ? { tokenHash: hashToken(token), tokenExpires: new Date(expires).toISOString() } : {}
+      await payload.create({ collection: MEMBERS as never, data: { link: set.id, user: p.id, status, addedBy: people[0]!.id, ...pending } as never, overrideAccess: true, context: ctx })
+    }
+    return { set: String(set.id), tokens }
+  }
+  const statuses = async (set: string) =>
+    ((await payload.find({ collection: MEMBERS as never, where: { link: { equals: set } }, depth: 0, overrideAccess: true, sort: 'createdAt' })).docs as unknown as { status: string }[]).map((d) => d.status)
+
+  it('keeps an approved set working: list, switch and unlink', async () => {
+    const [a, b, c] = await Promise.all(['a', 'b', 'c'].map((x) => make(email(x), 'author')))
+    await old([a!, b!, c!], 'approved')
+    const token = await login(a!.email!)
+    expect((await call('/hats', token, undefined, 'get')).body.linked.map((l: { label: string }) => l.label).sort()).toEqual([b!.email, c!.email].sort())
+    const res = await call('/hats/switch', token, { account: b!.id, hat: 'member' })
+    expect(res.status).toBe(200)
+    expect(hatsStateOf(await whoIs(res.token!))).toMatchObject({ via: String(a!.id) })
+    const gone = await call('/hats/unlink', res.token, { account: String(c!.id) })
+    expect(gone.status).toBe(200)
+    expect((await call('/hats', await login(a!.email!), undefined, 'get')).body.linked.map((l: { label: string }) => l.label)).toEqual([b!.email])
+  })
+
+  it('completes a pending request: both old tokens still confirm, and approval waits for both', async () => {
+    const approver = await make(email('maint'), 'admin', { maintainer: true })
+    const [a, b] = await Promise.all(['a', 'b'].map((x) => make(email(x), 'author')))
+    const { set, tokens } = await old([a!, b!], 'requested')
+    expect((await call('/hats/confirm', null, { token: tokens[1] })).status).toBe(200)
+    const rows = (await payload.find({ collection: MEMBERS as never, where: { link: { equals: set } }, depth: 0, overrideAccess: true })).docs as unknown as { id: string; user: unknown }[]
+    const theirs = rows.find((r) => String(r.user) === String(b!.id))!
+    const mine = rows.find((r) => String(r.user) === String(a!.id))!
+    // Approving now is refused for the row still waiting on its own email.
+    await expect(payload.update({ collection: MEMBERS as never, id: mine.id, data: { status: 'approved' } as never, user: approver as never, overrideAccess: false })).rejects.toThrow(/Only a confirmed account/)
+    expect((await call('/hats/switch', await login(a!.email!), { account: b!.id, hat: 'member' })).status).toBe(403)
+    expect((await call('/hats/confirm', null, { token: tokens[0] })).status).toBe(200)
+    expect((await call('/hats/confirm', null, { token: tokens[0] })).status).toBe(400) // still single use
+    for (const r of [mine, theirs]) await payload.update({ collection: MEMBERS as never, id: r.id, data: { status: 'approved' } as never, user: approver as never, overrideAccess: false })
+    expect(await statuses(set)).toEqual(['approved', 'approved'])
+    expect((await call('/hats/switch', await login(a!.email!), { account: b!.id, hat: 'member' })).status).toBe(200)
+  })
+
+  it('answers an expired old token with a way to ask again, and asking again works', async () => {
+    const [a, b] = await Promise.all(['a', 'b'].map((x) => make(email(x), 'member')))
+    const { tokens } = await old([a!, b!], 'requested', Date.now() - 60_000)
+    const res = await call('/hats/confirm', null, { token: tokens[1] })
+    expect(res.status).toBe(400)
+    expect(res.body).toMatch(/Ask again from your account page/)
+    mail.length = 0
+    expect((await call('/hats/link', await login(a!.email!), { email: b!.email })).status).toBe(202)
+    expect(mail.find((m) => m.to === b!.email)).toBeTruthy() // the old rows no longer hold b up
+    await confirmAll()
+    const set = (await payload.find({ collection: MEMBERS as never, where: { user: { equals: b!.id } }, depth: 0, overrideAccess: true })).docs as unknown as { status: string }[]
+    expect(set.map((d) => d.status)).toEqual(['confirmed'])
+  })
+
+  it('lets an asker with an old pending set ask for another account, which still needs every confirmation', async () => {
+    const approver = await make(email('maint'), 'admin', { maintainer: true })
+    const [a, b, c] = await Promise.all(['a', 'b', 'c'].map((x) => make(email(x), 'member')))
+    const { set } = await old([a!, b!], 'requested')
+    mail.length = 0
+    expect((await call('/hats/link', await login(a!.email!), { email: c!.email })).status).toBe(202)
+    await confirmAll()
+    const rows = (await payload.find({ collection: MEMBERS as never, where: { link: { equals: set } }, depth: 0, overrideAccess: true })).docs as unknown as { id: string; user: unknown; status: string }[]
+    expect(rows.find((r) => String(r.user) === String(c!.id))?.status).toBe('confirmed')
+    for (const who of [a!, b!]) {
+      const r = rows.find((x) => String(x.user) === String(who.id))!
+      expect(r.status).toBe('requested')
+      await expect(payload.update({ collection: MEMBERS as never, id: r.id, data: { status: 'approved' } as never, user: approver as never, overrideAccess: false })).rejects.toThrow(/Only a confirmed account/)
+    }
+  })
+
+  it('gives a handler written for 0.4.0 a real set id and strings on every link event', async () => {
+    events.length = 0
+    const approver = await make(email('maint'), 'admin', { maintainer: true })
+    const [a, b, c] = await Promise.all(['a', 'b', 'c'].map((x) => make(email(x), 'member')))
+    const linkTo = async (to: U) => {
+      mail.length = 0
+      expect((await call('/hats/link', await login(a!.email!), { email: to.email })).status).toBe(202)
+      await confirmAll()
+      const { docs } = await payload.find({ collection: MEMBERS as never, where: { and: [{ user: { in: [a!.id, to.id] } }, { status: { equals: 'confirmed' } }] }, depth: 0, overrideAccess: true })
+      for (const d of docs) await payload.update({ collection: MEMBERS as never, id: d.id, data: { status: 'approved' } as never, user: approver as never, overrideAccess: false })
+    }
+    await linkTo(b!) // a new set: the event waits until the set is made
+    await linkTo(c!) // an existing set: the event comes with the request
+    const old040 = (e: HatsEvent) => {
+      // What a 0.4.0 handler might do: string work on every field it was promised, and look the set up.
+      if (e.type === 'link-requested' || e.type === 'link-confirmed' || e.type === 'link-approved') return `${e.type}:${e.link.trim()}:${e.account.toUpperCase()}`
+      return e.type
+    }
+    const linkEvents = events.filter((e) => e.type.startsWith('link-'))
+    expect(linkEvents.filter((e) => e.type === 'link-requested')).toHaveLength(2)
+    for (const e of linkEvents) {
+      expect(() => old040(e)).not.toThrow()
+      const set = await payload.findByID({ collection: 'hat-links' as never, id: (e as { link: string }).link, overrideAccess: true, disableErrors: true })
+      expect(set).toBeTruthy()
+    }
+    const first = events.findIndex((e) => e.type === 'link-requested')
+    expect(events[first + 1]?.type).toBe('link-confirmed')
+    expect(events[first]).toMatchObject({ by: String(a!.id), account: String(b!.id) })
+  })
+})

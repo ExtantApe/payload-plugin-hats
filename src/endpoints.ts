@@ -383,7 +383,8 @@ const requestLink: Endpoint = {
         await asPlugin(req, () => req.payload.update({ collection: REQUESTS as never, id: (request as { id: string }).id, data: { account: null, tokenHash: null } as never, overrideAccess: true, req }))
         return
       }
-      await opts.onEvent?.({ type: 'link-requested', req, link: mine ? idOf(mine.link) : null, by: me, account: String(target.id) })
+      // With no set yet, the event waits for confirmation, when the set exists, so `link` is always a real set.
+      if (mine) await opts.onEvent?.({ type: 'link-requested', req, link: idOf(mine.link), by: me, account: String(target.id) })
     }
     let finished = false
     const done = work()
@@ -510,6 +511,7 @@ const confirm: Endpoint = {
         })
       return bad()
     }
+    if (made.link) await opts.onEvent?.({ type: 'link-requested', req, link: made.link, by, account })
     await opts.onEvent?.({ type: 'link-confirmed', payload: req.payload, link: existing ?? made.link!, account })
     return thanks()
   },

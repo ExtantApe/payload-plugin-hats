@@ -106,7 +106,7 @@ export type HatsOptions = {
 }
 
 export type HatsEvent =
-  | { type: 'link-requested'; req: PayloadRequest; /** The asker's set, or null when the set starts at confirmation. */ link: string | null; by: string; account: string }
+  | { type: 'link-requested'; req: PayloadRequest; /** The asker's set. When the asker had none, this fires as the set is made, just before `link-confirmed`, and `req` is the confirming request. */ link: string; by: string; account: string }
   | { type: 'link-confirmed'; payload: Payload; link: string; account: string }
   | { type: 'link-approved'; req: PayloadRequest; link: string; account: string; by: string }
   | { type: 'unlinked'; payload: Payload; link: string; account: string; by: string | null }

@@ -43,7 +43,7 @@ export const hats =
       ...options,
     }
     if (opts.maxLinked < 2) throw new Error('hats: maxLinked must be at least 2.')
-    if (typeof opts.linkAnswerMs !== 'number' || !Number.isFinite(opts.linkAnswerMs) || opts.linkAnswerMs < 0) throw new Error('hats: linkAnswerMs must be a number of milliseconds, 0 or more.')
+    if (typeof opts.linkAnswerMs !== 'number' || !Number.isFinite(opts.linkAnswerMs) || opts.linkAnswerMs < 0 || opts.linkAnswerMs > 2_147_483_647) throw new Error('hats: linkAnswerMs must be a number of milliseconds, from 0 to 2147483647.')
     const users = (config.collections ?? []).find((c) => c.slug === opts.users)
     if (!users?.auth) throw new Error(`hats: no auth collection "${opts.users}".`)
     if (typeof users.auth === 'object' && users.auth.useSessions === false) throw new Error('hats: needs Payload sessions; remove auth.useSessions: false.')
@@ -62,7 +62,10 @@ export const hats =
       await revokeSessions(req.payload, { or: [{ user: { equals: String(id) } }, { via: { equals: String(id) } }] }, 'account deleted', req)
       await asPlugin(req, async () => {
         await req.payload.delete({ collection: MEMBERS as never, where: { user: { equals: String(id) } }, overrideAccess: true, req })
-        await req.payload.delete({ collection: REQUESTS as never, where: { or: [{ requestedBy: { equals: String(id) } }, { account: { equals: String(id) } }] }, overrideAccess: true, req })
+        await req.payload.delete({ collection: REQUESTS as never, where: { requestedBy: { equals: String(id) } }, overrideAccess: true, req })
+        // Requests to the account stay, emptied, until they expire: they still count toward the asker's limit, so
+        // deleting an account frees nothing the asker could notice.
+        await req.payload.update({ collection: REQUESTS as never, where: { account: { equals: String(id) } }, data: { account: null, tokenHash: null } as never, overrideAccess: true, req })
       })
     }
     const afterLogout: CollectionAfterLogoutHook = async ({ req }) => {

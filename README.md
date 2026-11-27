@@ -7,13 +7,13 @@ Linked accounts and role hats for Payload. One person links their accounts and s
 ## What it does
 
 - **Linked accounts.** Up to 4 accounts per person. Linking needs both emails confirmed and an approver who isn't in the set. Unlinking is self-serve and immediate.
-- **A link request answers the same way whatever the address.** The asker gets the same answer, the same note by email, the same records to read and the same wait (`linkAnswerMs`, default 2000 ms) whether or not the address has an account, whatever state it is in. Only an account that can be linked is invited, and nothing joins a set until it confirms. Then the asker confirms from their own email. Open requests live in a `hat-requests` collection only the plugin reads, at most `maxLinked × 2` per account.
+- **A link request answers the same way whatever the address.** The asker gets the same answer, the same note by email, the same records to read and the same wait (`linkAnswerMs`, default 2000 ms) whether or not the address has an account, whatever state it is in. Only an account that can be linked is invited, one open invitation per account from everyone, and nothing joins a set until it confirms. Then the asker confirms from their own email. Open requests live in a `hat-requests` collection only the plugin reads or writes, at most `maxLinked × 2` per account.
 - **Hats.** Wearing a hat narrows the user before `req.user` exists, so every access rule follows it: admin, REST, GraphQL and the Local API with `req`. If narrowing fails, the request is signed out, never given full roles.
 - **Step-up.** Switching into a sensitive hat asks for that account's second factor, remembered for 180 minutes (`stepUp.rememberMinutes`) per account, or per linked set (see below).
 - **Step up on gain.** Pass `stepUpWhen` to decide for yourself when a switch asks for a code, in place of the `sensitive` flag. It gets the hat worn now (`from`) and the one it would become (`to`), each with the user as it would be worn, so a site can ask only when `to` holds a role or permission that `from` doesn't. Going down asks nothing, going up or sideways asks. Only an exact `false` skips the code. `true`, a throw or any other answer asks, so a broken check never lets a switch through.
 - **One code for the whole set.** `stepUp.rememberPer: 'set'` remembers a good code for every account in the same linked set, for the same 3 hours, so one two-step covers the person. The default, `'account'`, is unchanged. An account in no set is remembered on its own either way. `stepUp.available` and `stepUp.verify` also get `signedIn` (the account that actually signed in) and `set` (the linked set's id, or `null`), so a site can check against one two-step for the person. `user` stays the account being switched into.
 - **Revocation.** Unlinking, deleting a row, losing a role or deleting an account ends every session switched into or through it. Switched sessions also re-check their set on every request. An ended session's record is kept, marked revoked, so a session that Payload writes back by accident (two writes to an account's sessions at once) stays signed out. Old records are deleted once their Payload session is gone, at most 50 per switch.
-- **Link limits.** Pass `limit` to rate-limit link requests, per person and per email address. It must answer exactly `true` to allow one. Any other answer, or a throw, refuses the request with `tooMany` (429) and nothing is sent.
+- **Link limits.** Pass `limit` to rate-limit link requests. Key it by the email address as well as the person, so many accounts can't each ask for the same address. It must answer exactly `true` to allow one. Any other answer, or a throw, refuses the request with `tooMany` (429) and nothing is sent.
 
 Needs Payload sessions (`auth.useSessions`, on by default).
 
@@ -109,6 +109,18 @@ export async function POST(request: Request) {
 - **Call it only from a same-origin POST, never from a GET.** A link on another site can send someone to a GET, and `SameSite=Lax` sends the sign-in cookie on that top-level request, so a GET that switches would move them into a stronger account whenever a code is still remembered. Opening `/admin` may show an Enter admin screen with a button, and the code field when one is needed. The button posts. Nothing switches on the page load. `switchSession` checks this itself, and fails closed: it refuses (`notPost`, 405) unless `req.method` is POST, and refuses (`crossSite`, 403) when an `Origin` header is present and isn't this site's own origin (the request's URL or Payload's `serverURL`), or when `Sec-Fetch-Site` is present and isn't `same-origin`. The request you pass must carry the method, headers and URL, as in the sample. Also set `csrf` in your Payload config to your site's origins, so Payload's own cookie sign-in checks the same list.
 - Going back down to the account the person signed in with needs no new sign-in: the session's `via` keeps that account. With a gain-based `stepUpWhen` going down asks for no code. That holds while the link is approved and `blocked()` allows it. Unlinking, losing the role or deleting the account ends switched sessions, and the person signs in again. `onEvent`'s `switched` carries `via`, so admin work stays recorded against the staff account.
 - For one code per sitting across a person's accounts, use a gain-based `stepUpWhen` with `stepUp.rememberPer: 'set'`, and don't set `sensitive` on those hats. One code covers the whole set for `stepUp.rememberMinutes` (default 180), then it asks again. The plugin offers no "first entry ever": the expiry is what makes step-up worth having.
+
+## Upgrading from 0.4.0
+
+Sets already approved keep working, and requests still pending from 0.4.0 complete through their old links with the same confirmations and approval. To upgrade:
+
+1. Regenerate types with `payload generate:types` (new `hat-requests` collection). MongoDB needs nothing more.
+2. On Postgres or SQLite, add the table with `payload migrate:create`, then `payload migrate`.
+3. Review a custom `reasons.linkSent` text: it shouldn't name the address. Link requests now answer 202 after `linkAnswerMs`.
+4. In an `onEvent` handler, use `by` for the asker on `link-requested`. When the asker had no set, it fires as the other account confirms, on that request.
+5. Key `limit` by address as well as person.
+
+The changelog lists every change.
 
 ## Commands
 

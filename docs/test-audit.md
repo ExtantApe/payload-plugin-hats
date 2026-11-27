@@ -2,6 +2,14 @@
 
 Newest first.
 
+## 2026-11-27 (later): upgrading from 0.4.0, and the follow-up fixes
+
+Suite: 124 tests before, 135 after (same setup).
+
+- Promises: a site on 0.4.0 with linking on keeps its approved sets and pending requests working; 0.4.0 event handlers get the same shapes; one open invitation per account; only the plugin writes `hat-requests`; a deleted account frees no limit; a racing confirmation fails closed with a page, never a 500; `linkAnswerMs` stays a real wait; a confirmation can't land in a set the invitation came before.
+- Covered: "upgrading from 0.4.0 with linking on" (5 tests, on rows written the way 0.4.0 wrote them) and "link requests after review" (6 tests). Each new behavior fails against the previous commit.
+- Gaps skipped (and why): a SQL adapter migration (the collection is plain fields and Payload generates the table; worth one run on a throwaway SQLite before release); the admin screens and `LinkedAccounts` in a browser (unchanged code, and the client tests cover it); an age check (a design question, not built).
+
 ## 2026-11-27: a link request answers the same way whatever the address
 
 Suite: 115 tests before, 124 after (`npx vitest run`, real Payload 3.92, in-memory MongoDB, made-up accounts).

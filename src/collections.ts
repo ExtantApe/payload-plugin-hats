@@ -138,7 +138,8 @@ export function hatCollections(opts: ResolvedHatsOptions): CollectionConfig[] {
 
   // A link request waiting for the other account to confirm. Nobody reads or writes these but the plugin, so the
   // person asking can't tell from them whether the address they gave has an account. One is written for every
-  // request, whatever the address; `account` is set only when an invitation was sent.
+  // request, whatever the address; `account` is set only when an invitation was sent, and only one invitation to an
+  // account is open at a time.
   const requests: CollectionConfig = {
     slug: REQUESTS,
     admin: { hidden: true },
@@ -148,7 +149,18 @@ export function hatCollections(opts: ResolvedHatsOptions): CollectionConfig[] {
       { name: 'account', type: 'relationship', relationTo: opts.users as never, index: true },
       { name: 'tokenHash', type: 'text', index: true },
       { name: 'expiresAt', type: 'date', required: true, index: true },
+      // The asker's set when they asked, so a confirmation can't put the account into a set the invitation came before.
+      { name: 'link', type: 'text' },
     ],
+    hooks: {
+      beforeChange: [
+        ({ data, req }) => {
+          // Server code with overrideAccess included: a request written outside the plugin could be confirmed.
+          if (!internal(req)) throw new APIError('Only the hats plugin writes link requests.', 403, undefined, true)
+          return data
+        },
+      ],
+    },
   }
 
   return [links, members, sessions, requests]

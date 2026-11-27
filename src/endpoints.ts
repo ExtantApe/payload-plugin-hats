@@ -346,14 +346,17 @@ const requestLink: Endpoint = {
     const work = async () => {
       const { docs } = await req.payload.find({ collection: opts.users as never, where: { email: { equals: email } }, limit: 1, depth: 0, overrideAccess: true, pagination: false, req })
       const found = docs[0] as HatsUser | undefined
-      const target = found && String(found.id) !== me && !(await membershipOf(req, String(found.id))) ? found : null
+      let target = found && String(found.id) !== me && !(await membershipOf(req, String(found.id))) ? found : null
+      // One open invitation per account, from anyone, so nobody can fill an inbox with them. A request to an account
+      // already invited is written and answered the same way, with no invitation.
+      if (target && (await req.payload.count({ collection: REQUESTS as never, where: { account: { equals: target.id } }, overrideAccess: true, req })).totalDocs > 0) target = null
       // One record for every request, with the same fields. Only a real invitation's token can ever be used.
       const token = newToken()
       const hours = opts.confirmHours
       const request = await asPlugin(req, () =>
         req.payload.create({
           collection: REQUESTS as never,
-          data: { requestedBy: me, account: target ? target.id : null, tokenHash: hashToken(token), expiresAt: new Date(now.getTime() + hours * 3_600_000).toISOString() } as never,
+          data: { requestedBy: me, account: target ? target.id : null, tokenHash: hashToken(token), expiresAt: new Date(now.getTime() + hours * 3_600_000).toISOString(), link: mine ? idOf(mine.link) : null } as never,
           overrideAccess: true,
           req,
         }),
@@ -451,9 +454,14 @@ const confirm: Endpoint = {
 
     // The invited account confirming a request. The token works once: the request is deleted before anything else.
     const found = await req.payload.find({ collection: REQUESTS as never, where: { tokenHash: { equals: hash } }, limit: 1, depth: 0, overrideAccess: true, pagination: false, req })
-    const r = found.docs[0] as unknown as { id: string; requestedBy: unknown; account?: unknown; expiresAt: string } | undefined
+    const r = found.docs[0] as unknown as { id: string; requestedBy: unknown; account?: unknown; expiresAt: string; link?: string | null } | undefined
     if (!r || r.account == null || new Date(r.expiresAt).getTime() < Date.now()) return bad()
-    const gone = await asPlugin(req, () => req.payload.delete({ collection: REQUESTS as never, where: { and: [{ id: { equals: r.id } }, { tokenHash: { equals: hash } }] }, overrideAccess: true, req }))
+    let gone: unknown
+    try {
+      gone = await asPlugin(req, () => req.payload.delete({ collection: REQUESTS as never, where: { and: [{ id: { equals: r.id } }, { tokenHash: { equals: hash } }] }, overrideAccess: true, req }))
+    } catch {
+      return bad() // the same token confirmed at the same moment: the other confirmation has it
+    }
     if ((gone as { docs?: unknown[] }).docs?.length !== 1) return bad()
     const by = idOf(r.requestedBy)
     const account = idOf(r.account)
@@ -463,6 +471,13 @@ const confirm: Endpoint = {
     if (!asker || !invited || (await membershipOf(req, account))) return bad()
     const mine = await membershipOf(req, by)
     const existing = mine ? idOf(mine.link) : null
+    // The invitation was for the asker's set as it was then. A set the asker started since, from another of their own
+    // requests, is still theirs; any other change (they joined or left a set) needs a new request.
+    const was = r.link ? String(r.link) : null
+    if (existing !== was) {
+      const started = was === null && existing ? ((await req.payload.findByID({ collection: LINKS as never, id: existing, depth: 0, overrideAccess: true, disableErrors: true, req })) as { requestedBy?: unknown } | null) : null
+      if (!started || idOf(started.requestedBy) !== by) return bad()
+    }
     if (existing && (await members(req, existing)).length + 1 > opts.maxLinked) return bad()
 
     const made: { link?: string; rows: string[] } = { rows: [] }

@@ -151,11 +151,15 @@ function ownOrigins(req: PayloadRequest): string[] {
   return out
 }
 
-/** Reads a header from a Headers object or a plain object (any key case). Null when there are no headers at all. */
+/** Reads a header from a Headers instance or a plain object (any key case). Null for anything else, which is refused as cross-site. */
 function headerReader(h: unknown): ((name: string) => string | null) | null {
-  if (!h || typeof h !== 'object') return null
-  if (typeof (h as Headers).get === 'function') return (name) => (h as Headers).get(name)
+  if (h instanceof Headers) return (name) => h.get(name)
+  const proto = h && typeof h === 'object' ? Object.getPrototypeOf(h) : undefined
+  if (proto !== Object.prototype && proto !== null) return null
   const entries = Object.entries(h as Record<string, unknown>)
+  // Header values are strings (or lists of them, as Node gives them); a function or anything else means this isn't headers.
+  const plain = (v: unknown) => v == null || typeof v === 'string' || (Array.isArray(v) && v.every((x) => typeof x === 'string'))
+  if (!entries.every(([, v]) => plain(v))) return null
   return (name) => {
     const hit = entries.find(([k]) => k.toLowerCase() === name)
     if (!hit) return null

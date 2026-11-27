@@ -880,6 +880,19 @@ describe('switchSession and the endpoint share one switch', () => {
     expect(await switchSession(fine, { hat: 'member' })).toMatchObject({ ok: true })
   })
 
+  it('treats headers that are not a Headers instance or a plain object as cross-site', async () => {
+    const admin = await make(email('admin'), 'admin')
+    const token = await login(admin.email!)
+    const odd: unknown[] = [[['origin', 'https://site.example']], new Map([['origin', 'https://site.example']]), { get: () => undefined }, 'origin: x', 5]
+    for (const headers of odd) {
+      const req = await reqFor(token)
+      ;(req as { headers: unknown }).headers = headers
+      // the Map and the array are refused outright; a class instance with a get() is not trusted either
+      expect(await switchSession(req, { hat: 'member' })).toMatchObject({ ok: false, reason: 'crossSite' })
+    }
+    expect((await whoIs(token))!.level).toBe('admin')
+  })
+
   it('refuses an unverified account when the collection verifies emails, and lets it in once verified', async () => {
     const { a, b } = await pair2()
     const auth = payload.collections.users!.config.auth as { verify: unknown }

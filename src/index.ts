@@ -3,7 +3,7 @@ import type { PayloadRequest, CollectionAfterChangeHook, CollectionAfterDeleteHo
 import { hatCollections } from './collections.js'
 import { hatEndpoints, runSwitch, type SwitchInput, type SwitchResult } from './endpoints.js'
 import { revokeSessions, wrapStrategies } from './sessions.js'
-import { asPlugin } from './state.js'
+import { asPlugin, newToken } from './state.js'
 import { MEMBERS, REQUESTS, SESSIONS, type HatsOptions, type HatsUser, type ResolvedHatsOptions } from './types.js'
 
 export { hatsStateOf } from './state.js'
@@ -64,8 +64,8 @@ export const hats =
         await req.payload.delete({ collection: MEMBERS as never, where: { user: { equals: String(id) } }, overrideAccess: true, req })
         await req.payload.delete({ collection: REQUESTS as never, where: { requestedBy: { equals: String(id) } }, overrideAccess: true, req })
         // Requests to the account stay, emptied, until they expire: they still count toward the asker's limit, so
-        // deleting an account frees nothing the asker could notice.
-        await req.payload.update({ collection: REQUESTS as never, where: { account: { equals: String(id) } }, data: { account: null, tokenHash: null } as never, overrideAccess: true, req })
+        // deleting an account frees nothing the asker could notice. At most one request holds the account.
+        await req.payload.update({ collection: REQUESTS as never, where: { account: { equals: String(id) } }, data: { account: null, holds: `none:${newToken()}`, tokenHash: null } as never, overrideAccess: true, req })
       })
     }
     const afterLogout: CollectionAfterLogoutHook = async ({ req }) => {

@@ -24,16 +24,35 @@ export const hatsOptions = (payload: Payload) => payload.config.custom?.hats as 
 export const newToken = () => randomBytes(32).toString('base64url')
 export const hashToken = (token: string) => createHash('sha256').update(`hats:${token}`).digest('hex')
 
-/** Runs `fn` with the request marked as the plugin's own, then puts the mark back as it was. */
-export async function asPlugin<T>(req: PayloadRequest, fn: () => Promise<T>): Promise<T> {
-  const before = req.context?.hatsInternal
-  req.context = { ...(req.context ?? {}), hatsInternal: true }
+/**
+ * The marks the plugin puts on its own writes. They live in a map only this module holds, keyed by the request
+ * object, so code outside the plugin can't set them: nothing in `context` (which any server code can pass) counts.
+ * Payload's Local API keeps the same request object through nested calls and hooks when `req` is passed, which every
+ * plugin write does. (Symbol keys on `context` don't work: Payload treats a context with only symbol keys as empty.)
+ */
+export const INTERNAL: unique symbol = Symbol('hats: the plugin itself')
+export const DISSOLVING: unique symbol = Symbol('hats: dissolving a set')
+type Mark = typeof INTERNAL | typeof DISSOLVING
+const marks = new WeakMap<object, Map<Mark, number>>()
+
+const has = (req: PayloadRequest | undefined, mark: Mark) => Boolean(req && (marks.get(req)?.get(mark) ?? 0) > 0)
+export const isInternal = (req: PayloadRequest) => has(req, INTERNAL)
+export const isDissolving = (req: PayloadRequest) => has(req, DISSOLVING)
+
+/** Runs `fn` with the request carrying `mark`, then takes the mark off again. Nested and parallel calls count up. */
+export async function withMark<T>(req: PayloadRequest, mark: Mark, fn: () => Promise<T>): Promise<T> {
+  const held = marks.get(req) ?? new Map<Mark, number>()
+  marks.set(req, held)
+  held.set(mark, (held.get(mark) ?? 0) + 1)
   try {
     return await fn()
   } finally {
-    req.context.hatsInternal = before
+    held.set(mark, (held.get(mark) ?? 1) - 1)
   }
 }
+
+/** Runs `fn` with the request marked as the plugin's own, then puts the mark back as it was. */
+export const asPlugin = <T>(req: PayloadRequest, fn: () => Promise<T>): Promise<T> => withMark(req, INTERNAL, fn)
 
 export const idOf = (v: unknown) => String(v && typeof v === 'object' && 'id' in v ? (v as { id: unknown }).id : v)
 export type { HatsUser }

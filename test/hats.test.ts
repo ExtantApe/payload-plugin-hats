@@ -4,7 +4,7 @@ import { buildConfig, createLocalReq, createPayloadRequest, getPayload, type San
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 
 import { applyHat, cleanupSessions, hats, hatsStateOf, MEMBERS, REQUESTS, SESSIONS, switchSession, type Hat, type HatsEvent, type HatsUser } from '../src/index.js'
-import { hashToken } from '../src/state.js'
+import { asPlugin, hashToken } from '../src/state.js'
 import type { ResolvedHatsOptions } from '../src/types.js'
 
 /**
@@ -29,7 +29,7 @@ const mail: { to: string; text: string }[] = []
 const events: HatsEvent[] = []
 let masquerading = false
 /** Stand-in answers for the site's own checks, so a test can make them say something other than true or false. */
-const answers: { approve?: () => unknown; available?: () => unknown; verify?: () => unknown; limit?: () => unknown; blocked?: () => unknown } = {}
+const answers: { approve?: () => unknown; available?: () => unknown; verify?: () => unknown; limit?: () => unknown; blocked?: () => unknown; event?: (e: HatsEvent) => unknown } = {}
 /** Truthy answers that aren't `true`, and a thrown error: every one must be a no. */
 const NOT_TRUE: [string, () => unknown][] = [
   ['1', () => 1],
@@ -44,6 +44,11 @@ const NOT_TRUE: [string, () => unknown][] = [
   }],
 ]
 
+/** Writes as the plugin itself, as only the plugin's own code can: the mark is private to its modules. */
+const plugin = async <T,>(fn: (req: PayloadRequest) => Promise<T>) => {
+  const req = await createLocalReq({}, payload)
+  return asPlugin(req, () => fn(req))
+}
 const tokenFrom = (text: string) => /token=([\w-]+)/.exec(text)?.[1] ?? ''
 const endpoint = (path: string, method: string) => (payload.config.endpoints as Endpoint[]).find((e) => e.path === path && e.method === method)!
 /** The signed-in user for a token, exactly as REST, GraphQL and the admin see it (Payload's auth strategies). */
@@ -143,7 +148,10 @@ beforeAll(async () => {
           },
           sendEmail: async ({ to, text }) => void mail.push({ to, text }),
           linkAnswerMs: 100,
-          onEvent: (e) => void events.push(e),
+          onEvent: (e) => {
+            events.push(e)
+            if (answers.event) return answers.event(e) as void
+          },
         }),
       ],
     })
@@ -164,6 +172,7 @@ beforeEach(() => {
   delete answers.verify
   delete answers.limit
   delete answers.blocked
+  delete answers.event
   mail.length = 0
 })
 
@@ -376,7 +385,7 @@ describe('linking', () => {
     expect((await call('/hats', token, undefined, 'get')).body.set).toEqual([])
     const t = tokenFrom(mail.find((m) => m.to === fresh.email)!.text)
     const req = (await payload.find({ collection: REQUESTS as never, where: { account: { equals: fresh.id } }, overrideAccess: true })).docs[0]!
-    await payload.update({ collection: REQUESTS as never, id: req.id, data: { expiresAt: new Date(Date.now() - 1000).toISOString() } as never, overrideAccess: true , context: { hatsInternal: true } }) // as time passing would
+    await plugin((r) => payload.update({ collection: REQUESTS as never, id: req.id, data: { expiresAt: new Date(Date.now() - 1000).toISOString() } as never, overrideAccess: true , req: r })) // as time passing would
     expect((await call('/hats/confirm', null, { token: t })).status).toBe(400)
     expect((await payload.find({ collection: MEMBERS as never, where: { user: { in: [a.id, fresh.id] } }, overrideAccess: true })).totalDocs).toBe(0)
   })
@@ -1354,7 +1363,7 @@ describe('a link request answers the same way whatever the address', () => {
     for (const kind of Object.keys(BRANCHES)) expect(seen[kind], kind).toEqual(seen.missing)
     // And what they all look like: a 202, one note to the asker, one request record each time, nothing readable.
     expect(seen.missing).toMatchObject([
-      { status: 202, own: [expect.any(String)], writes: { [`create ${REQUESTS}`]: 1 }, pending: 1, read: { members: 'refused 403', links: 'refused 403', requests: 'refused 403' } },
+      { status: 202, own: [expect.any(String)], writes: { [`create ${REQUESTS}`]: 1, [`updateOne ${REQUESTS}`]: 1 }, pending: 1, read: { members: 'refused 403', links: 'refused 403', requests: 'refused 403' } },
       { status: 202, pending: 2 },
     ])
   })
@@ -1463,7 +1472,7 @@ describe('confirming a link request fails closed', () => {
   it('refuses a request token for an address that got no invitation, or one already in a set', async () => {
     const asker = await make(email('a'), 'member')
     const token = 'made-up-token-for-a-request-with-no-account'
-    await payload.create({ collection: REQUESTS as never, data: { requestedBy: asker.id, account: null, tokenHash: hashToken(token), expiresAt: new Date(Date.now() + 3_600_000).toISOString() } as never, overrideAccess: true , context: { hatsInternal: true } })
+    await plugin((r) => payload.create({ collection: REQUESTS as never, data: { requestedBy: asker.id, account: null, holds: 'none:made-up', tokenHash: hashToken(token), expiresAt: new Date(Date.now() + 3_600_000).toISOString() } as never, overrideAccess: true , req: r }))
     expect((await call('/hats/confirm', null, { token })).status).toBe(400)
 
     const target = await make(email('t'), 'member')
@@ -1489,11 +1498,10 @@ describe('confirming a link request fails closed', () => {
   it('refuses approving past maxLinked, however the rows got there', async () => {
     const approver = await make(email('maint'), 'admin', { maintainer: true })
     const people = await Promise.all(['a', 'b', 'c', 'd', 'e'].map((x) => make(email(x), 'member')))
-    const ctx = { hatsInternal: true }
-    const set = await payload.create({ collection: 'hat-links' as never, data: { label: 'made up' } as never, overrideAccess: true, context: ctx })
+      const set = await plugin((r) => payload.create({ collection: 'hat-links' as never, data: { label: 'made up' } as never, overrideAccess: true, req: r }))
     const rows = []
     for (const [i, p] of people.entries())
-      rows.push(await payload.create({ collection: MEMBERS as never, data: { link: set.id, user: p.id, status: i < 4 ? 'approved' : 'confirmed' } as never, overrideAccess: true, context: ctx }))
+      rows.push(await plugin((r) => payload.create({ collection: MEMBERS as never, data: { link: set.id, user: p.id, status: i < 4 ? 'approved' : 'confirmed' } as never, overrideAccess: true, req: r })))
     await expect(payload.update({ collection: MEMBERS as never, id: rows[4]!.id, data: { status: 'approved' } as never, user: approver as never, overrideAccess: false })).rejects.toThrow(/at most 4/)
   })
 
@@ -1522,16 +1530,15 @@ describe('confirming a link request fails closed', () => {
 })
 
 describe('upgrading from 0.4.0 with linking on', () => {
-  const ctx = { hatsInternal: true }
   /** Records exactly as 0.4.0 wrote them: a set, and a member row per account with that status (and a token while requested). */
   async function old(people: U[], status: 'requested' | 'confirmed' | 'approved', expires = Date.now() + 3_600_000) {
-    const set = await payload.create({ collection: 'hat-links' as never, data: { requestedBy: people[0]!.id, label: `Started by ${people[0]!.email}` } as never, overrideAccess: true, context: ctx })
+    const set = await plugin((r) => payload.create({ collection: 'hat-links' as never, data: { requestedBy: people[0]!.id, label: `Started by ${people[0]!.email}` } as never, overrideAccess: true, req: r }))
     const tokens: string[] = []
     for (const p of people) {
       const token = `old-token-${p.id}`
       tokens.push(token)
       const pending = status === 'requested' ? { tokenHash: hashToken(token), tokenExpires: new Date(expires).toISOString() } : {}
-      await payload.create({ collection: MEMBERS as never, data: { link: set.id, user: p.id, status, addedBy: people[0]!.id, ...pending } as never, overrideAccess: true, context: ctx })
+      await plugin((r) => payload.create({ collection: MEMBERS as never, data: { link: set.id, user: p.id, status, addedBy: people[0]!.id, ...pending } as never, overrideAccess: true, req: r }))
     }
     return { set: String(set.id), tokens }
   }
@@ -1631,7 +1638,6 @@ describe('upgrading from 0.4.0 with linking on', () => {
 })
 
 describe('link requests after review', () => {
-  const ctx = { hatsInternal: true }
   const ask = async (asker: U, address: string) => {
     mail.length = 0
     const res = await call('/hats/link', await login(asker.email!), { email: address })
@@ -1707,8 +1713,8 @@ describe('link requests after review', () => {
     const [a, b, x, y] = await Promise.all(['a', 'b', 'x', 'y'].map((n) => make(email(n), 'member')))
     const tb = tokenFrom((await ask(a!, b!.email!)).mail.find((m) => m.to === 'other')!.text)
     // a joins x's approved set.
-    const set = await payload.create({ collection: 'hat-links' as never, data: { requestedBy: x!.id, label: 'made up' } as never, overrideAccess: true, context: ctx })
-    for (const p of [x!, a!]) await payload.create({ collection: MEMBERS as never, data: { link: set.id, user: p.id, status: 'approved' } as never, overrideAccess: true, context: ctx })
+    const set = await plugin((r) => payload.create({ collection: 'hat-links' as never, data: { requestedBy: x!.id, label: 'made up' } as never, overrideAccess: true, req: r }))
+    for (const p of [x!, a!]) await plugin((r) => payload.create({ collection: MEMBERS as never, data: { link: set.id, user: p.id, status: 'approved' } as never, overrideAccess: true, req: r }))
     expect((await call('/hats/confirm', null, { token: tb })).status).toBe(400)
     expect((await payload.count({ collection: MEMBERS as never, where: { user: { equals: b!.id } }, overrideAccess: true })).totalDocs).toBe(0)
 
@@ -1721,5 +1727,71 @@ describe('link requests after review', () => {
     expect((await call('/hats/confirm', null, { token: td })).status).toBe(200)
     const rows = (await payload.find({ collection: MEMBERS as never, where: { user: { in: [y!.id, c.id, d.id] } }, depth: 0, overrideAccess: true })).docs as unknown as { link: unknown }[]
     expect(new Set(rows.map((r) => String(r.link))).size).toBe(1)
+  })
+
+  it('holds one open invitation per account with many askers at once, round after round, and the askers can’t tell', async () => {
+    const askers = await Promise.all(['a', 'b', 'c', 'd', 'e', 'f'].map((x) => make(email(x), 'member')))
+    const tokens = await Promise.all(askers.map((a) => login(a.email!)))
+    // Rows that hold nothing: requests to addresses with no account, from every asker.
+    for (const [i] of askers.entries()) await call('/hats/link', tokens[i]!, { email: email('nobody') })
+    mail.length = 0
+    const nobody = await call('/hats/link', tokens[0]!, { email: email('nobody') })
+    const reference = { status: nobody.status, body: nobody.body, mail: mail.filter((m) => m.to === askers[0]!.email).length }
+    for (let round = 0; round < 5; round++) {
+      const target = await make(email('t'), 'member')
+      mail.length = 0
+      const started = Date.now()
+      const replies = await Promise.all(tokens.map((t) => call('/hats/link', t, { email: target.email })))
+      expect(Date.now() - started).toBeGreaterThanOrEqual(100)
+      for (const r of replies) expect([r.status, r.body]).toEqual([reference.status, reference.body])
+      // Work past the answer may still be finishing under this load; wait for every asker's note (up to 5 s).
+      for (let i = 0; i < 50 && mail.filter((m) => askers.some((a) => a.email === m.to)).length < askers.length * reference.mail; i++) await new Promise((r) => setTimeout(r, 100))
+      await new Promise((r) => setTimeout(r, 100))
+      expect(mail.filter((m) => m.to === target.email)).toHaveLength(1)
+      for (const a of askers) expect(mail.filter((m) => m.to === a.email)).toHaveLength(reference.mail)
+      expect(await requestsTo(target)).toBe(1)
+      // Every request is still written, one per asker.
+      const rows = (await payload.find({ collection: REQUESTS as never, where: { requestedBy: { in: askers.map((a) => a.id) } }, overrideAccess: true, pagination: false })).docs as unknown as { holds: string }[]
+      expect(rows).toHaveLength(askers.length * (round + 2) + 1)
+      expect(rows.filter((r) => r.holds === `account:${String(target.id)}`)).toHaveLength(1)
+    }
+  })
+
+  it('confirms a link even when the site’s onEvent handler throws, logs it without details, and still sends link-confirmed', async () => {
+    const logged: unknown[] = []
+    const error = payload.logger.error.bind(payload.logger)
+    payload.logger.error = ((...args: unknown[]) => void logged.push(args)) as never
+    try {
+      for (const failing of ['link-requested', 'link-confirmed'] as const) {
+        const [a, b] = await Promise.all(['a', 'b'].map((x) => make(email(x), 'member')))
+        answers.event = (e) => {
+          if (e.type === failing) throw new Error(`made-up failure about ${b!.email}`)
+        }
+        events.length = 0
+        const token = tokenFrom((await ask(a!, b!.email!)).mail.find((m) => m.to === 'other')!.text)
+        expect((await call('/hats/confirm', null, { token })).status).toBe(200)
+        expect((await payload.count({ collection: MEMBERS as never, where: { user: { in: [a!.id, b!.id] } }, overrideAccess: true })).totalDocs).toBe(2)
+        expect(events.map((e) => e.type)).toEqual(['link-requested', 'link-confirmed'])
+
+        // Asking from a set fires link-requested at ask time; a throw there changes nothing the asker sees.
+        const c = await make(email('c'), 'member')
+        const sent = await ask(a!, c.email!)
+        expect(sent.status).toBe(202)
+        expect(sent.mail.filter((m) => m.to === 'other')).toHaveLength(1)
+      }
+      expect(logged.length).toBeGreaterThanOrEqual(3)
+      expect(JSON.stringify(logged)).not.toMatch(/made-up failure|@example\.invalid/)
+    } finally {
+      payload.logger.error = error
+    }
+  })
+
+  it('ignores a string marker in context: server code can’t pass as the plugin', async () => {
+    const asker = await make(email('a'), 'member')
+    const target = await make(email('t'), 'member')
+    const data = { requestedBy: asker.id, account: target.id, holds: `account:${String(target.id)}`, tokenHash: hashToken('made-up'), expiresAt: new Date(Date.now() + 3_600_000).toISOString() }
+    for (const context of [{ hatsInternal: true }, { hatsInternal: true, hatsDissolving: true }])
+      await expect(payload.create({ collection: REQUESTS as never, data: data as never, overrideAccess: true, context })).rejects.toThrow(/Only the hats plugin/)
+    expect(await requestsTo(target)).toBe(0)
   })
 })

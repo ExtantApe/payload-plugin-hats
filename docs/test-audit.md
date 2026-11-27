@@ -2,6 +2,14 @@
 
 Newest first.
 
+## 2026-11-27 (review round two): concurrent requests, failing handlers, the plugin's mark
+
+Suite: 135 tests before, 138 after (same setup).
+
+- Promises: one open invitation per account holds when many requests arrive at once, kept by a unique `holds` key in the database; every request makes the same writes; a throwing `onEvent` handler can't turn a confirmation into an error, leave it half done or skip `link-confirmed`, and its log line carries no details; server code can't pass as the plugin through `context`.
+- Covered: "link requests after review": six concurrent askers over five rounds; throwing handlers on `link-requested` and `link-confirmed`, at confirmation and at ask time; string markers in `context` refused. The write-count test now expects a create and an update for every kind of address. All fail against the previous commit.
+- Gaps skipped (and why): a SQL adapter (no SQL adapter in the dev dependencies; the field is a plain unique text column); a real MongoDB deployment and `autoIndex` off (the in-memory replica set builds the same unique index).
+
 ## 2026-11-27 (later): upgrading from 0.4.0, and the follow-up fixes
 
 Suite: 124 tests before, 135 after (same setup).

@@ -1,6 +1,6 @@
 import type { AuthStrategy, Payload, PayloadRequest, Where } from 'payload'
 
-import { asPlugin, attachState, hatsOptions, idOf } from './state.js'
+import { asPlugin, attachState, DISSOLVING, hatsOptions, idOf, withMark } from './state.js'
 import { LINKS, MEMBERS, SESSIONS, type Hat, type HatsState, type HatsUser, type ResolvedHatsOptions } from './types.js'
 
 type SessionDoc = { id: string; sid: string; user: string; via?: string | null; link?: string | null; hat?: string | null; steppedUp?: Record<string, string> | null; revokedAt?: string | null; expiresAt?: string | null }
@@ -46,16 +46,12 @@ export async function revokeSessions(payload: Payload, where: Where, reason: str
 export async function dissolveIfAlone(payload: Payload, link: string, req: PayloadRequest) {
   const { docs } = await payload.find({ collection: MEMBERS as never, where: { link: { equals: link } }, limit: 0, depth: 0, overrideAccess: true, pagination: false, req })
   if (docs.length > 1) return
-  const before = req.context?.hatsDissolving
-  req.context = { ...(req.context ?? {}), hatsDissolving: true }
-  try {
-    await asPlugin(req, async () => {
+  await withMark(req, DISSOLVING, () =>
+    asPlugin(req, async () => {
       for (const d of docs) await payload.delete({ collection: MEMBERS as never, id: d.id, overrideAccess: true, req })
       await payload.delete({ collection: LINKS as never, where: { id: { equals: link } }, overrideAccess: true, req })
-    })
-  } finally {
-    req.context.hatsDissolving = before
-  }
+    }),
+  )
   await revokeSessions(payload, { link: { equals: link } }, 'set dissolved', req)
 }
 

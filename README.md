@@ -7,7 +7,7 @@ Linked accounts and role hats for Payload. One person links their accounts and s
 ## What it does
 
 - **Linked accounts.** Up to 4 accounts per person. Linking needs both emails confirmed and an approver who isn't in the set. Unlinking is self-serve and immediate.
-- **A link request answers the same way whatever the address.** The asker gets the same answer, the same note by email, the same records to read and the same wait (`linkAnswerMs`, default 2000 ms) whether or not the address has an account, whatever state it is in. Only an account that can be linked is invited, one open invitation per account from everyone, and nothing joins a set until it confirms. Then the asker confirms from their own email. Open requests live in a `hat-requests` collection only the plugin reads or writes, at most `maxLinked × 2` per account.
+- **A link request answers the same way whatever the address.** The asker gets the same answer, the same note by email, the same records to read and the same wait (`linkAnswerMs`, default 2000 ms) whether or not the address has an account, whatever state it is in. Only an account that can be linked is invited, one open invitation per account from everyone (a unique key in the database holds this, even for requests that arrive together), and nothing joins a set until it confirms. Then the asker confirms from their own email. Open requests live in a `hat-requests` collection that no user can read and only the plugin can write, at most `maxLinked × 2` per account.
 - **Hats.** Wearing a hat narrows the user before `req.user` exists, so every access rule follows it: admin, REST, GraphQL and the Local API with `req`. If narrowing fails, the request is signed out, never given full roles.
 - **Step-up.** Switching into a sensitive hat asks for that account's second factor, remembered for 180 minutes (`stepUp.rememberMinutes`) per account, or per linked set (see below).
 - **Step up on gain.** Pass `stepUpWhen` to decide for yourself when a switch asks for a code, in place of the `sensitive` flag. It gets the hat worn now (`from`) and the one it would become (`to`), each with the user as it would be worn, so a site can ask only when `to` holds a role or permission that `from` doesn't. Going down asks nothing, going up or sideways asks. Only an exact `false` skips the code. `true`, a throw or any other answer asks, so a broken check never lets a switch through.
@@ -114,10 +114,10 @@ export async function POST(request: Request) {
 
 Sets already approved keep working, and requests still pending from 0.4.0 complete through their old links with the same confirmations and approval. To upgrade:
 
-1. Regenerate types with `payload generate:types` (new `hat-requests` collection). MongoDB needs nothing more.
-2. On Postgres or SQLite, add the table with `payload migrate:create`, then `payload migrate`.
+1. Regenerate types with `payload generate:types` (new `hat-requests` collection). MongoDB needs nothing more, unless Mongoose's `autoIndex` is off: then build the collection's indexes, including the unique one on `holds`.
+2. On Postgres or SQLite, add the table, with its unique `holds` column, through `payload migrate:create`, then `payload migrate`.
 3. Review a custom `reasons.linkSent` text: it shouldn't name the address. Link requests now answer 202 after `linkAnswerMs`.
-4. In an `onEvent` handler, use `by` for the asker on `link-requested`. When the asker had no set, it fires as the other account confirms, on that request.
+4. In an `onEvent` handler, use `by` for the asker on `link-requested`. It fires at ask time only when the asker is already in a set. Otherwise it fires as the other account confirms, just before `link-confirmed`, on that request: `req.user` there may be nobody, or the invited person, who may be a child. A handler that throws during a confirmation is logged and skipped, and the confirmation still completes.
 5. Key `limit` by address as well as person.
 
 The changelog lists every change.

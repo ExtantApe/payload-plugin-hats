@@ -2,10 +2,10 @@ import { APIError, type CollectionConfig, type PayloadRequest } from 'payload'
 
 import { exactlyTrue } from './access.js'
 import { dissolveIfAlone, revokeSessions } from './sessions.js'
-import { hatsStateOf, idOf } from './state.js'
+import { hatsStateOf, idOf, isDissolving, isInternal } from './state.js'
 import { LINKS, MEMBERS, REQUESTS, SESSIONS, type HatsUser, type ResolvedHatsOptions } from './types.js'
 
-const internal = (req: PayloadRequest) => req.context?.hatsInternal === true
+const internal = isInternal
 
 /**
  * Whether the request's user may approve links. A person never approves their own link: an approver who is (or
@@ -112,7 +112,7 @@ export function hatCollections(opts: ResolvedHatsOptions): CollectionConfig[] {
           const account = idOf(doc.user)
           await revokeSessions(req.payload, { and: [{ link: { equals: link } }, { or: [{ user: { equals: account } }, { via: { equals: account } }] }] }, 'unlinked', req)
           if (!internal(req)) await opts.onEvent?.({ type: 'unlinked', payload: req.payload, link, account, by: req.user ? String((req.user as HatsUser).id) : null })
-          if (!req.context?.hatsDissolving) await dissolveIfAlone(req.payload, link, req)
+          if (!isDissolving(req)) await dissolveIfAlone(req.payload, link, req)
         },
       ],
     },
@@ -139,7 +139,7 @@ export function hatCollections(opts: ResolvedHatsOptions): CollectionConfig[] {
   // A link request waiting for the other account to confirm. Nobody reads or writes these but the plugin, so the
   // person asking can't tell from them whether the address they gave has an account. One is written for every
   // request, whatever the address; `account` is set only when an invitation was sent, and only one invitation to an
-  // account is open at a time.
+  // account is open at a time, which the unique `holds` field enforces.
   const requests: CollectionConfig = {
     slug: REQUESTS,
     admin: { hidden: true },
@@ -147,6 +147,9 @@ export function hatCollections(opts: ResolvedHatsOptions): CollectionConfig[] {
     fields: [
       { name: 'requestedBy', type: 'relationship', relationTo: opts.users as never, required: true, index: true },
       { name: 'account', type: 'relationship', relationTo: opts.users as never, index: true },
+      // Unique, so the database keeps it to one open invitation per account even when requests arrive together:
+      // `account:<id>` while an invitation is open, otherwise a random `none:` value that holds nothing.
+      { name: 'holds', type: 'text', required: true, unique: true, index: true },
       { name: 'tokenHash', type: 'text', index: true },
       { name: 'expiresAt', type: 'date', required: true, index: true },
       // The asker's set when they asked, so a confirmation can't put the account into a set the invitation came before.

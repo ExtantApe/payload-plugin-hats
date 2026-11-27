@@ -106,6 +106,7 @@ beforeAll(async () => {
             { name: 'maintainer', type: 'checkbox' },
             { name: 'code', type: 'text' },
             { name: 'disabled', type: 'checkbox' },
+            { name: '_verified', type: 'checkbox', admin: { hidden: true } }, // what Payload adds when auth.verify is on; the test turns that on by hand
           ],
         },
         { slug: 'secrets', access: { read: ({ req }) => (req.user as U | null)?.level === 'admin' }, fields: [{ name: 'text', type: 'text' }] },
@@ -862,6 +863,38 @@ describe('switchSession and the endpoint share one switch', () => {
     for (const r of [locked.e, locked.f]) expect([r.ok, r.status, r.reason]).toEqual([false, 403, 'locked'])
     await payload.update({ collection: 'users', id: b.id, data: { lockUntil: new Date(Date.now() - 1000).toISOString() } as never, overrideAccess: true, showHiddenFields: true } as never)
     expect((await viaFunction(await login(a.email!), { account: b.id, hat: 'curator', code: '444444' })).ok).toBe(true)
+  })
+
+  it('refuses when the headers are a plain object with a foreign Origin, and when there are no headers at all', async () => {
+    const admin = await make(email('admin'), 'admin')
+    const token = await login(admin.email!)
+    const bad = await reqFor(token)
+    ;(bad as { headers: unknown }).headers = { Origin: 'https://evil.example', 'Sec-Fetch-Site': 'cross-site' }
+    expect(await switchSession(bad, { hat: 'member' })).toMatchObject({ ok: false, reason: 'crossSite' })
+    const none = await reqFor(token)
+    ;(none as { headers: unknown }).headers = undefined
+    expect(await switchSession(none, { hat: 'member' })).toMatchObject({ ok: false, reason: 'crossSite' })
+    expect((await whoIs(token))!.level).toBe('admin')
+    const fine = await reqFor(token)
+    ;(fine as { headers: unknown }).headers = { origin: 'https://site.example' }
+    expect(await switchSession(fine, { hat: 'member' })).toMatchObject({ ok: true })
+  })
+
+  it('refuses an unverified account when the collection verifies emails, and lets it in once verified', async () => {
+    const { a, b } = await pair2()
+    const auth = payload.collections.users!.config.auth as { verify: unknown }
+    const saved = auth.verify
+    try {
+      auth.verify = true
+      await payload.update({ collection: 'users', id: a.id, data: { _verified: true } as never, overrideAccess: true, showHiddenFields: true } as never)
+      await payload.update({ collection: 'users', id: b.id, data: { _verified: false } as never, overrideAccess: true, showHiddenFields: true } as never)
+      const r = await both(() => login(a.email!), { account: b.id, hat: 'curator', code: '444444' })
+      for (const x of [r.e, r.f]) expect([x.ok, x.status, x.reason]).toEqual([false, 403, 'unverified'])
+      await payload.update({ collection: 'users', id: b.id, data: { _verified: true } as never, overrideAccess: true, showHiddenFields: true } as never)
+      expect((await viaFunction(await login(a.email!), { account: b.id, hat: 'curator', code: '444444' })).ok).toBe(true)
+    } finally {
+      auth.verify = saved
+    }
   })
 
   it('refuses a request whose user is from another collection even with a valid session state', async () => {

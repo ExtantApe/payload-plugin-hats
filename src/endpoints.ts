@@ -151,12 +151,27 @@ function ownOrigins(req: PayloadRequest): string[] {
   return out
 }
 
+/** Reads a header from a Headers object or a plain object (any key case). Null when there are no headers at all. */
+function headerReader(h: unknown): ((name: string) => string | null) | null {
+  if (!h || typeof h !== 'object') return null
+  if (typeof (h as Headers).get === 'function') return (name) => (h as Headers).get(name)
+  const entries = Object.entries(h as Record<string, unknown>)
+  return (name) => {
+    const hit = entries.find(([k]) => k.toLowerCase() === name)
+    if (!hit) return null
+    const v = hit[1]
+    return Array.isArray(v) ? v.join(', ') : v == null ? null : String(v)
+  }
+}
+
 /** A switch only comes from the site's own POST: any other method, a foreign Origin or a Sec-Fetch-Site other than same-origin is refused. */
 function refuseCrossSite(req: PayloadRequest) {
   if (String(req.method ?? '').toUpperCase() !== 'POST') refuse('Switching needs a POST from this site.', 405, 'notPost')
-  const origin = req.headers?.get?.('origin')
+  const header = headerReader(req.headers)
+  if (!header) return refuse('Switching must come from this site.', 403, 'crossSite') // no headers to check, so no way to tell: refused
+  const origin = header('origin')
   if (origin != null && !ownOrigins(req).includes(origin)) refuse('Switching must come from this site.', 403, 'crossSite')
-  const fetchSite = req.headers?.get?.('sec-fetch-site')
+  const fetchSite = header('sec-fetch-site')
   if (fetchSite != null && fetchSite !== 'same-origin') refuse('Switching must come from this site.', 403, 'crossSite')
 }
 
@@ -177,6 +192,9 @@ async function switchCore(req: PayloadRequest, body: SwitchInput): Promise<Switc
   // Direct login refuses a locked account, so a switch into one is refused too.
   const lockUntil = to === current ? null : (target as { lockUntil?: unknown }).lockUntil
   if (lockUntil != null && new Date(lockUntil as string).getTime() > Date.now()) refuse('That account is locked. Try again later.', 403, 'locked')
+  // Direct login refuses an unverified account when the collection verifies emails, so a switch does too.
+  const usersAuth = req.payload.collections[opts.users as never]!.config.auth
+  if (to !== current && usersAuth.verify && (target as { _verified?: unknown })._verified === false) refuse('That account’s email isn’t confirmed yet.', 403, 'unverified')
   const { linked } = await linkedAccounts(req, current)
   if (!(opts.showSwitch ?? defaultShow)({ user: full, hats: opts.hatsOf(full), linked })) refuse('Switching isn’t available for this account.', 403, 'notAvailable')
 

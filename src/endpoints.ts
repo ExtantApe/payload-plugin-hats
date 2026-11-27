@@ -5,7 +5,7 @@ import { blockedBy, exactlyTrue } from './access.js'
 import { cleanupSessions, revokeSessions, revokeSid, sessionBySid, sharedLink, tombstone, wornHat } from './sessions.js'
 import { memoryKey, needsStepUp, remembered } from './stepup.js'
 import { asPlugin, hashToken, hatsOptions, hatsStateOf, idOf, newToken } from './state.js'
-import { LINKS, MEMBERS, SESSIONS, type Hat, type HatsUser, type ResolvedHatsOptions } from './types.js'
+import { LINKS, MEMBERS, REQUESTS, SESSIONS, type Hat, type HatsUser, type ResolvedHatsOptions } from './types.js'
 
 const json = (body: unknown, status = 200, cookies: string[] = []) => {
   const headers = new Headers({ 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
@@ -292,9 +292,21 @@ const switchHat: Endpoint = {
 
 const expiry = (seconds: number) => new Date(Date.now() + seconds * 1000).toISOString()
 
-const SENT = 'If that account can be linked, we’ve emailed it a link to confirm. Confirm from your own email too; then an administrator reviews the link.'
+const SENT =
+  'If that address belongs to an account that can be linked, we’ve emailed it a link to confirm. Once it’s confirmed, we’ll email you to confirm from your side, and then an administrator reviews the link.'
 
-/** POST /api/hats/link { email }: ask to link the acting account with another. Says the same thing whatever happens to the other account. */
+const confirmLink = (req: PayloadRequest, opts: ResolvedHatsOptions, token: string) =>
+  opts.confirmURL ? opts.confirmURL({ req, token }) : `${new URL(req.url ?? 'http://localhost').origin}${req.payload.config.routes.api}/hats/confirm?token=${token}`
+
+/** Open link requests one account may have at once. Counted the same whatever the addresses were. */
+const pendingCap = (opts: ResolvedHatsOptions) => opts.maxLinked * 2
+
+/**
+ * POST /api/hats/link { email }: ask to link the acting account with another. The person asking learns nothing
+ * about the address: the answer, the time it takes, their own email, the records they can read and the records
+ * written for them are the same whether or not it has an account, whatever state that account is in. Only the
+ * other account hears about it, and nothing changes on the asker's side until that account confirms.
+ */
 const requestLink: Endpoint = {
   path: '/hats/link',
   method: 'post',
@@ -310,54 +322,77 @@ const requestLink: Endpoint = {
     const me = String(full.id)
     const now = new Date()
 
+    // Everything up to here depends only on the asker and what they typed. From here on the answer waits for the
+    // same fixed time whatever happens, so how long the work takes says nothing about the address.
+    const answer = new Promise<void>((resolve) => setTimeout(resolve, opts.linkAnswerMs))
+
     await asPlugin(req, async () => {
       // Requests nobody confirmed in time don't hold anyone up.
-      await req.payload.delete({
-        collection: MEMBERS as never,
-        where: { and: [{ status: { equals: 'requested' } }, { tokenExpires: { less_than: now.toISOString() } }] },
-        overrideAccess: true,
-        showHiddenFields: true,
-        req,
-      })
+      await req.payload.delete({ collection: MEMBERS as never, where: { and: [{ status: { equals: 'requested' } }, { tokenExpires: { less_than: now.toISOString() } }] }, overrideAccess: true, showHiddenFields: true, req })
+      await req.payload.delete({ collection: REQUESTS as never, where: { expiresAt: { less_than: now.toISOString() } }, overrideAccess: true, req })
     })
     const mine = await membershipOf(req, me)
     const already = mine ? (await members(req, idOf(mine.link))).length : 0
-    if (already + (mine ? 1 : 2) > opts.maxLinked) refuse(`A set can hold at most ${opts.maxLinked} accounts.`, 400, 'setFull')
+    if (already + (mine ? 1 : 2) > opts.maxLinked) {
+      await answer
+      refuse(`A set can hold at most ${opts.maxLinked} accounts.`, 400, 'setFull')
+    }
+    const open = await req.payload.count({ collection: REQUESTS as never, where: { requestedBy: { equals: me } }, overrideAccess: true, req })
+    if (open.totalDocs >= pendingCap(opts)) {
+      await answer
+      refuse('Too many link requests. Try again later.', 429, 'tooMany')
+    }
 
-    const { docs } = await req.payload.find({ collection: opts.users as never, where: { email: { equals: email } }, limit: 1, depth: 0, overrideAccess: true, pagination: false, req })
-    const target = docs[0] as HatsUser | undefined
-    if (!target || String(target.id) === me || (await membershipOf(req, String(target.id)))) return json({ ok: true, reason: 'linkSent', message: SENT }, 202)
-
-    const hours = opts.confirmHours
-    const invite = async (user: HatsUser, link: string) => {
+    const work = async () => {
+      const { docs } = await req.payload.find({ collection: opts.users as never, where: { email: { equals: email } }, limit: 1, depth: 0, overrideAccess: true, pagination: false, req })
+      const found = docs[0] as HatsUser | undefined
+      const target = found && String(found.id) !== me && !(await membershipOf(req, String(found.id))) ? found : null
+      // One record for every request, with the same fields. Only a real invitation's token can ever be used.
       const token = newToken()
-      await req.payload.create({
-        collection: MEMBERS as never,
-        data: { link, user: user.id, status: 'requested', tokenHash: hashToken(token), tokenExpires: new Date(now.getTime() + hours * 3_600_000).toISOString(), addedBy: me } as never,
-        overrideAccess: true,
-        req,
-      })
-      const url = opts.confirmURL ? opts.confirmURL({ req, token }) : `${new URL(req.url ?? 'http://localhost').origin}${req.payload.config.routes.api}/hats/confirm?token=${token}`
-      await opts.sendEmail({
-        payload: req.payload,
-        to: String(user.email),
-        subject: 'Confirm linking your accounts',
-        text: `Someone asked to link ${labelOf(full)} and ${labelOf(target)}, so one person can switch between them.\n\nIf that was you, confirm here within ${hours} hours:\n${url}\n\nIf it wasn’t you, ignore this email: nothing is linked without it.`,
-      })
+      const hours = opts.confirmHours
+      const request = await asPlugin(req, () =>
+        req.payload.create({
+          collection: REQUESTS as never,
+          data: { requestedBy: me, account: target ? target.id : null, tokenHash: hashToken(token), expiresAt: new Date(now.getTime() + hours * 3_600_000).toISOString() } as never,
+          overrideAccess: true,
+          req,
+        }),
+      )
+      // The asker's own note is the same every time and leaves the address out, so it can't tell them anything.
+      try {
+        await opts.sendEmail({
+          payload: req.payload,
+          to: String(full.email),
+          subject: 'You asked to link an account',
+          text: `You asked to link ${labelOf(full)} with another account, so one person can switch between them.\n\nIf the address you entered belongs to an account that can be linked, we’ve emailed it a link to confirm within ${hours} hours. Once it’s confirmed, we’ll email you a link to confirm from your side, and then an administrator reviews the link. If nobody confirms, nothing is linked.\n\nIf you didn’t ask for this, change your password.`,
+        })
+      } catch (err) {
+        req.payload.logger.warn({ err }, 'Hats: link request note not sent')
+      }
+      if (!target) return
+      try {
+        await opts.sendEmail({
+          payload: req.payload,
+          to: String(target.email),
+          subject: 'Confirm linking your accounts',
+          text: `Someone signed in as ${labelOf(full)} asked to link that account with ${labelOf(target)}, so one person can switch between them.\n\nIf that was you, confirm here within ${hours} hours:\n${confirmLink(req, opts, token)}\n\nIf it wasn’t you, ignore this email: nothing is linked without it.`,
+        })
+      } catch (err) {
+        // The invitation never arrived, so its token must never work.
+        req.payload.logger.warn({ err }, 'Hats: link invitation not sent')
+        await asPlugin(req, () => req.payload.update({ collection: REQUESTS as never, id: (request as { id: string }).id, data: { account: null, tokenHash: null } as never, overrideAccess: true, req }))
+        return
+      }
+      await opts.onEvent?.({ type: 'link-requested', req, link: mine ? idOf(mine.link) : null, by: me, account: String(target.id) })
     }
-    let link = mine ? idOf(mine.link) : null
-    try {
-      await asPlugin(req, async () => {
-        if (!link) link = String((await req.payload.create({ collection: LINKS as never, data: { requestedBy: me, label: `Started by ${labelOf(full)}` } as never, overrideAccess: true, req })).id)
-        if (!mine) await invite(full, link)
-        await invite(target, link)
+    let finished = false
+    const done = work()
+      .catch((err) => req.payload.logger.warn({ err }, 'Hats: link request not finished'))
+      .finally(() => {
+        finished = true
       })
-    } catch (error) {
-      // Someone else linked that account a moment ago (the one-set-per-account index): say the same as always.
-      req.payload.logger.warn({ err: error }, 'Hats: link request not recorded')
-      return json({ ok: true, reason: 'linkSent', message: SENT }, 202)
-    }
-    await opts.onEvent?.({ type: 'link-requested', req, link: link!, by: me, account: String(target.id) })
+    await answer
+    if (!finished) void done.then(() => req.payload.logger.info('Hats: a link request finished after its answer. Raise linkAnswerMs if this repeats.'))
     return json({ ok: true, reason: 'linkSent', message: SENT }, 202)
   },
 }
@@ -396,14 +431,87 @@ const confirm: Endpoint = {
     }
     const bad = () => page('That link didn’t work', '<p>It may have expired or been used already. Ask again from your account page.</p>', 400)
     if (!token) return bad()
-    const { docs } = await req.payload.find({ collection: MEMBERS as never, where: { tokenHash: { equals: hashToken(token) } }, limit: 1, depth: 0, overrideAccess: true, showHiddenFields: true, pagination: false, req })
+    const opts = hatsOptions(req.payload)
+    const hash = hashToken(token)
+    const thanks = () => page('Confirmed', '<p>Thanks. Once every account in the link is confirmed, an administrator reviews it. You can close this page.</p>')
+
+    // The asker confirming their own side, after the other account confirmed.
+    const { docs } = await req.payload.find({ collection: MEMBERS as never, where: { tokenHash: { equals: hash } }, limit: 1, depth: 0, overrideAccess: true, showHiddenFields: true, pagination: false, req })
     const m = docs[0] as unknown as { id: string; link: unknown; user: unknown; status: string; tokenExpires?: string } | undefined
-    if (!m || m.status !== 'requested' || !m.tokenExpires || new Date(m.tokenExpires).getTime() < Date.now()) return bad()
-    await asPlugin(req, () =>
-      req.payload.update({ collection: MEMBERS as never, id: m.id, data: { status: 'confirmed', confirmedAt: new Date().toISOString(), tokenHash: null, tokenExpires: null } as never, overrideAccess: true, req }),
-    )
-    await hatsOptions(req.payload).onEvent?.({ type: 'link-confirmed', payload: req.payload, link: idOf(m.link), account: idOf(m.user) })
-    return page('Confirmed', '<p>Thanks. Once every account in the link is confirmed, an administrator reviews it. You can close this page.</p>')
+    if (m) {
+      if (m.status !== 'requested' || !m.tokenExpires || new Date(m.tokenExpires).getTime() < Date.now()) return bad()
+      if ((await members(req, idOf(m.link))).length > opts.maxLinked) return bad()
+      await asPlugin(req, () =>
+        req.payload.update({ collection: MEMBERS as never, id: m.id, data: { status: 'confirmed', confirmedAt: new Date().toISOString(), tokenHash: null, tokenExpires: null } as never, overrideAccess: true, req }),
+      )
+      await opts.onEvent?.({ type: 'link-confirmed', payload: req.payload, link: idOf(m.link), account: idOf(m.user) })
+      return thanks()
+    }
+
+    // The invited account confirming a request. The token works once: the request is deleted before anything else.
+    const found = await req.payload.find({ collection: REQUESTS as never, where: { tokenHash: { equals: hash } }, limit: 1, depth: 0, overrideAccess: true, pagination: false, req })
+    const r = found.docs[0] as unknown as { id: string; requestedBy: unknown; account?: unknown; expiresAt: string } | undefined
+    if (!r || r.account == null || new Date(r.expiresAt).getTime() < Date.now()) return bad()
+    const gone = await asPlugin(req, () => req.payload.delete({ collection: REQUESTS as never, where: { and: [{ id: { equals: r.id } }, { tokenHash: { equals: hash } }] }, overrideAccess: true, req }))
+    if ((gone as { docs?: unknown[] }).docs?.length !== 1) return bad()
+    const by = idOf(r.requestedBy)
+    const account = idOf(r.account)
+    if (by === account) return bad()
+    const asker = await loadUser(req, by)
+    const invited = await loadUser(req, account)
+    if (!asker || !invited || (await membershipOf(req, account))) return bad()
+    const mine = await membershipOf(req, by)
+    const existing = mine ? idOf(mine.link) : null
+    if (existing && (await members(req, existing)).length + 1 > opts.maxLinked) return bad()
+
+    const made: { link?: string; rows: string[] } = { rows: [] }
+    try {
+      await asPlugin(req, async () => {
+        const link = existing ?? String((await req.payload.create({ collection: LINKS as never, data: { requestedBy: by, label: `Started by ${labelOf(asker)}` } as never, overrideAccess: true, req })).id)
+        if (!existing) made.link = link
+        const now = new Date()
+        const row = await req.payload.create({
+          collection: MEMBERS as never,
+          data: { link, user: account, status: 'confirmed', confirmedAt: now.toISOString(), addedBy: by } as never,
+          overrideAccess: true,
+          req,
+        })
+        made.rows.push(String(row.id))
+        if (!mine) {
+          // The asker confirms from their own email too, now that the other account has said yes.
+          const own = newToken()
+          const hours = opts.confirmHours
+          const ownRow = await req.payload.create({
+            collection: MEMBERS as never,
+            data: { link, user: by, status: 'requested', tokenHash: hashToken(own), tokenExpires: new Date(now.getTime() + hours * 3_600_000).toISOString(), addedBy: by } as never,
+            overrideAccess: true,
+            req,
+          })
+          made.rows.push(String(ownRow.id))
+          await opts.sendEmail({
+            payload: req.payload,
+            to: String(asker.email),
+            subject: 'Confirm linking your accounts',
+            text: `${labelOf(invited)} agreed to link with ${labelOf(asker)}, so one person can switch between them.\n\nConfirm from your side here within ${hours} hours:\n${confirmLink(req, opts, own)}\n\nIf you didn’t ask for this, ignore this email: nothing is linked without it.`,
+          })
+        }
+      })
+    } catch (error) {
+      // Someone linked one of these accounts a moment ago, or the email didn't go: undo what this made.
+      req.payload.logger.warn({ err: error }, 'Hats: link confirmation not recorded')
+      await asPlugin(req, async () => {
+        req.context = { ...req.context, hatsDissolving: true }
+        for (const id of made.rows) await req.payload.delete({ collection: MEMBERS as never, where: { id: { equals: id } }, overrideAccess: true, req })
+        if (made.link) await req.payload.delete({ collection: LINKS as never, where: { id: { equals: made.link } }, overrideAccess: true, req })
+      })
+        .catch((err) => req.payload.logger.warn({ err }, 'Hats: link confirmation clean-up skipped'))
+        .finally(() => {
+          req.context.hatsDissolving = undefined
+        })
+      return bad()
+    }
+    await opts.onEvent?.({ type: 'link-confirmed', payload: req.payload, link: existing ?? made.link!, account })
+    return thanks()
   },
 }
 
@@ -419,7 +527,8 @@ const unlink: Endpoint = {
     const account = String((req.data as { account?: unknown } | undefined)?.account ?? me)
     const mine = await membershipOf(req, me)
     const theirs = account === me ? mine : await membershipOf(req, account)
-    if (!mine || !theirs || idOf(mine.link) !== idOf(theirs.link)) refuse('That account isn’t in your linked set.', 404, 'notInSet')
+    // Another account still waiting to confirm is hidden from the set, so it answers as if it weren't there.
+    if (!mine || !theirs || idOf(mine.link) !== idOf(theirs.link) || (account !== me && theirs.status === 'requested')) refuse('That account isn’t in your linked set.', 404, 'notInSet')
     const link = idOf(theirs!.link)
     await asPlugin(req, () => req.payload.delete({ collection: MEMBERS as never, id: theirs!.id, overrideAccess: true, req }))
     await opts.onEvent?.({ type: 'unlinked', payload: req.payload, link, account, by: me })

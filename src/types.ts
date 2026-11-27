@@ -96,10 +96,17 @@ export type HatsOptions = {
   adminSwitch?: boolean
   /** Hours a confirmation link works. Default 24. */
   confirmHours?: number
+  /**
+   * How long a link request takes to answer, in milliseconds, whatever the address. The records and emails for a
+   * request run within this time, so the answer arrives at the same moment whether or not the address has an
+   * account. Work still running when it's up carries on after the answer, and is logged. Keep it above your slowest
+   * email send, especially on hosts that stop work once a response is sent. Default 2000.
+   */
+  linkAnswerMs?: number
 }
 
 export type HatsEvent =
-  | { type: 'link-requested'; req: PayloadRequest; link: string; by: string; account: string }
+  | { type: 'link-requested'; req: PayloadRequest; /** The asker's set, or null when the set starts at confirmation. */ link: string | null; by: string; account: string }
   | { type: 'link-confirmed'; payload: Payload; link: string; account: string }
   | { type: 'link-approved'; req: PayloadRequest; link: string; account: string; by: string }
   | { type: 'unlinked'; payload: Payload; link: string; account: string; by: string | null }
@@ -112,3 +119,4 @@ export type ResolvedHatsOptions = Required<Omit<HatsOptions, 'stepUp' | 'stepUpW
 export const LINKS = 'hat-links'
 export const MEMBERS = 'hat-members'
 export const SESSIONS = 'hat-sessions'
+export const REQUESTS = 'hat-requests'

@@ -2,6 +2,15 @@
 
 Newest first.
 
+## 2026-11-27: a link request answers the same way whatever the address
+
+Suite: 115 tests before, 124 after (`npx vitest run`, real Payload 3.92, in-memory MongoDB, made-up accounts).
+
+- Promises: the asker can't tell whether an address has an account, or what state it is in (missing, existing, locked, unverified, linked, waiting on another request, a minor, their own), from the answer, their emails, `GET /hats`, Local API reads with access on, the writes made, the open-request count, a second request, or the time taken; only an account that can be linked is invited; nothing joins a set before it confirms; request tokens work once, expire and are cleared when the invitation fails; no set passes `maxLinked` at confirmation or approval; an unconfirmed asker can't be unlinked or seen by the invited account; deleting an account removes its requests.
+- Covered: "a link request answers the same way whatever the address" (4 tests: the eight-branch comparison with write counts, the pending cap, the answer time with slow, hanging and failing sends, and a reported median) and "confirming a link request fails closed" (5 tests). The linking tests were updated for the new order. All 9 new tests fail against the previous code (checked on a scratch copy with the old `src`).
+- Timing is asserted by structure: no answer before `linkAnswerMs`, and the answer doesn't wait for an invitation still in flight. Wall clock is measured once and reported in the changelog, not asserted.
+- Gaps skipped (and why): GraphQL reads of `hat-requests` (its access is `never` on every operation, the same rule REST and Local API tests already prove); a real mail server and a serverless host (outside a unit suite; the README says to keep `linkAnswerMs` above the slowest send).
+
 ## 2026-11-22: stepUpWhen, the redesigned switch and the accessibility fixes (0.2.0 to 0.3.1)
 
 - Promises: only gaining roles asks for a code; `stepUpWhen` failing, rejecting or answering anything but false asks for a code, and a site with no second factor on that account still refuses; a code covers its own account unless `rememberPer` is set, then a set for three hours; `steppedUp` is reported only when a code was given; safe hats switch on a tap and sensitive ones confirm; the switch, the note and the account page meet WCAG 2.2 AA (live region present while empty, focus after Dismiss, Unlink and refusals, focus ring and border tokens for 1.4.11, a 32px minimum target for 2.5.8, no English defaults left when every text is replaced).

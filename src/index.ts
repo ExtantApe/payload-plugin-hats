@@ -4,11 +4,11 @@ import { hatCollections } from './collections.js'
 import { hatEndpoints, runSwitch, type SwitchInput, type SwitchResult } from './endpoints.js'
 import { revokeSessions, wrapStrategies } from './sessions.js'
 import { asPlugin } from './state.js'
-import { MEMBERS, SESSIONS, type HatsOptions, type HatsUser, type ResolvedHatsOptions } from './types.js'
+import { MEMBERS, REQUESTS, SESSIONS, type HatsOptions, type HatsUser, type ResolvedHatsOptions } from './types.js'
 
 export { hatsStateOf } from './state.js'
 export { applyHat, cleanupSessions, revokeSessions } from './sessions.js'
-export { LINKS, MEMBERS, SESSIONS } from './types.js'
+export { LINKS, MEMBERS, REQUESTS, SESSIONS } from './types.js'
 export type { SwitchInput, SwitchResult }
 
 /**
@@ -36,16 +36,18 @@ export const hats =
       users: 'users',
       maxLinked: 4,
       confirmHours: 24,
+      linkAnswerMs: 2000,
       showSwitch: undefined as never,
       adminSwitch: true,
       sendEmail: ({ payload, to, subject, text }) => payload.sendEmail({ to, subject, text }),
       ...options,
     }
     if (opts.maxLinked < 2) throw new Error('hats: maxLinked must be at least 2.')
+    if (typeof opts.linkAnswerMs !== 'number' || !Number.isFinite(opts.linkAnswerMs) || opts.linkAnswerMs < 0) throw new Error('hats: linkAnswerMs must be a number of milliseconds, 0 or more.')
     const users = (config.collections ?? []).find((c) => c.slug === opts.users)
     if (!users?.auth) throw new Error(`hats: no auth collection "${opts.users}".`)
     if (typeof users.auth === 'object' && users.auth.useSessions === false) throw new Error('hats: needs Payload sessions; remove auth.useSessions: false.')
-    for (const slug of ['hat-links', MEMBERS, SESSIONS])
+    for (const slug of ['hat-links', MEMBERS, SESSIONS, REQUESTS])
       if ((config.collections ?? []).some((c) => c.slug === slug)) throw new Error(`hats: a collection "${slug}" already exists.`)
 
     const ids = (u: unknown) => new Set(opts.hatsOf(u as HatsUser).map((h) => h.id))
@@ -58,7 +60,10 @@ export const hats =
     }
     const afterDelete: CollectionAfterDeleteHook = async ({ id, req }) => {
       await revokeSessions(req.payload, { or: [{ user: { equals: String(id) } }, { via: { equals: String(id) } }] }, 'account deleted', req)
-      await asPlugin(req, () => req.payload.delete({ collection: MEMBERS as never, where: { user: { equals: String(id) } }, overrideAccess: true, req }))
+      await asPlugin(req, async () => {
+        await req.payload.delete({ collection: MEMBERS as never, where: { user: { equals: String(id) } }, overrideAccess: true, req })
+        await req.payload.delete({ collection: REQUESTS as never, where: { or: [{ requestedBy: { equals: String(id) } }, { account: { equals: String(id) } }] }, overrideAccess: true, req })
+      })
     }
     const afterLogout: CollectionAfterLogoutHook = async ({ req }) => {
       const sid = (req.user as HatsUser | null)?._sid

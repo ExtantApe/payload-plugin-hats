@@ -7,6 +7,7 @@ Linked accounts and role hats for Payload. One person links their accounts and s
 ## What it does
 
 - **Linked accounts.** Up to 4 accounts per person. Linking needs both emails confirmed and an approver who isn't in the set. Unlinking is self-serve and immediate.
+- **A link request answers the same way whatever the address.** The asker gets the same answer, the same note by email, the same records to read and the same wait (`linkAnswerMs`, default 2000 ms) whether or not the address has an account, whatever state it is in. Only an account that can be linked is invited, and nothing joins a set until it confirms. Then the asker confirms from their own email. Open requests live in a `hat-requests` collection only the plugin reads, at most `maxLinked × 2` per account.
 - **Hats.** Wearing a hat narrows the user before `req.user` exists, so every access rule follows it: admin, REST, GraphQL and the Local API with `req`. If narrowing fails, the request is signed out, never given full roles.
 - **Step-up.** Switching into a sensitive hat asks for that account's second factor, remembered for 180 minutes (`stepUp.rememberMinutes`) per account, or per linked set (see below).
 - **Step up on gain.** Pass `stepUpWhen` to decide for yourself when a switch asks for a code, in place of the `sensitive` flag. It gets the hat worn now (`from`) and the one it would become (`to`), each with the user as it would be worn, so a site can ask only when `to` holds a role or permission that `from` doesn't. Going down asks nothing, going up or sideways asks. Only an exact `false` skips the code. `true`, a throw or any other answer asks, so a broken check never lets a switch through.
@@ -56,7 +57,7 @@ Endpoints, under the API route:
 
 - `GET /hats` lists the acting account, its hats and its linked accounts.
 - `POST /hats/switch { account?, hat, code? }` switches hat or account.
-- `POST /hats/link { email }` asks to link another account.
+- `POST /hats/link { email }` asks to link another account. It answers 202 after `linkAnswerMs` whatever the address. Set `linkAnswerMs` above your slowest email send: work still running when it's up carries on after the answer, which a host that stops work after a response would cut short.
 - `GET` and `POST /hats/confirm` handle the email confirmation.
 - `POST /hats/unlink { account? }` takes an account out of the set.
 

@@ -3,7 +3,8 @@ import { MongoMemoryReplSet } from 'mongodb-memory-server'
 import { buildConfig, createLocalReq, createPayloadRequest, getPayload, type SanitizedConfig, type Endpoint, type Payload, type PayloadRequest } from 'payload'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 
-import { applyHat, cleanupSessions, hats, hatsStateOf, MEMBERS, SESSIONS, switchSession, type Hat, type HatsEvent, type HatsUser } from '../src/index.js'
+import { applyHat, cleanupSessions, hats, hatsStateOf, MEMBERS, REQUESTS, SESSIONS, switchSession, type Hat, type HatsEvent, type HatsUser } from '../src/index.js'
+import { hashToken } from '../src/state.js'
 import type { ResolvedHatsOptions } from '../src/types.js'
 
 /**
@@ -79,12 +80,25 @@ const canReadSecrets = async (user: U | null) => {
   }
 }
 
-/** Links accounts the way people do: request, both confirm by email, a maintainer outside the set approves. */
+/** Confirms every token mailed so far, and the ones those confirmations mail, once each. */
+async function confirmAll() {
+  const used = new Set<string>()
+  for (;;) {
+    const fresh = mail.map((m) => tokenFrom(m.text)).filter((t) => t && !used.has(t))
+    if (!fresh.length) return
+    for (const t of fresh) {
+      used.add(t)
+      expect((await call('/hats/confirm', null, { token: t })).status).toBe(200)
+    }
+  }
+}
+
+/** Links accounts the way people do: request, the other account confirms, then the asker, then a maintainer outside the set approves. */
 async function link(from: U, to: U, approver: U) {
   mail.length = 0
   const res = await call('/hats/link', await login(from.email!), { email: to.email })
   expect(res.status).toBe(202)
-  for (const m of [...mail]) expect((await call('/hats/confirm', null, { token: tokenFrom(m.text) })).status).toBe(200)
+  await confirmAll()
   const { docs } = await payload.find({ collection: MEMBERS as never, where: { status: { equals: 'confirmed' } }, depth: 0, overrideAccess: true })
   for (const d of docs) await payload.update({ collection: MEMBERS as never, id: d.id, data: { status: 'approved' } as never, user: approver as never, overrideAccess: false })
 }
@@ -106,6 +120,7 @@ beforeAll(async () => {
             { name: 'maintainer', type: 'checkbox' },
             { name: 'code', type: 'text' },
             { name: 'disabled', type: 'checkbox' },
+            { name: 'minorUntil', type: 'date' }, // as an age check might store it; the plugin never reads it
             { name: '_verified', type: 'checkbox', admin: { hidden: true } }, // what Payload adds when auth.verify is on; the test turns that on by hand
           ],
         },
@@ -127,6 +142,7 @@ beforeAll(async () => {
             return !email.startsWith('limited-')
           },
           sendEmail: async ({ to, text }) => void mail.push({ to, text }),
+          linkAnswerMs: 100,
           onEvent: (e) => void events.push(e),
         }),
       ],
@@ -301,19 +317,33 @@ describe('linking', () => {
     const b = await make(email('b'), 'member')
     const res = await call('/hats/link', await login(maint.email!), { email: b.email })
     expect(res.status).toBe(202)
+    // The asker gets a note with no token; only the other account gets a link to confirm.
     expect(mail.map((m) => m.to).sort()).toEqual([maint.email, b.email].sort())
-    const [t1, t2] = mail.map((m) => tokenFrom(m.text))
-
-    const row = async () => (await payload.find({ collection: MEMBERS as never, where: { user: { equals: b.id } }, overrideAccess: true })).docs[0]!
-    // Not before it's confirmed.
-    await expect(payload.update({ collection: MEMBERS as never, id: (await row()).id, data: { status: 'approved' } as never, user: other as never, overrideAccess: false })).rejects.toThrow(/confirmed/)
+    expect(tokenFrom(mail.find((m) => m.to === maint.email)!.text)).toBe('')
+    const tb = tokenFrom(mail.find((m) => m.to === b.email)!.text)
+    expect(tb).not.toBe('')
+    const rowOf = async (u: U) => (await payload.find({ collection: MEMBERS as never, where: { user: { equals: u.id } }, overrideAccess: true })).docs[0]
+    // Nothing is in a set until the other account confirms.
+    expect(await rowOf(maint)).toBeUndefined()
+    expect(await rowOf(b)).toBeUndefined()
 
     // A mail scanner opening the link confirms nothing.
     expect((await call('/hats/confirm', null, undefined, 'get')).status).toBe(200)
-    expect((await row()).status).toBe('requested')
-    for (const t of [t1, t2]) expect((await call('/hats/confirm', null, { token: t })).status).toBe(200)
-    expect((await call('/hats/confirm', null, { token: t1 })).status).toBe(400) // once only
-    expect((await row()).status).toBe('confirmed')
+    expect(await rowOf(b)).toBeUndefined()
+    mail.length = 0
+    expect((await call('/hats/confirm', null, { token: tb })).status).toBe(200)
+    expect((await call('/hats/confirm', null, { token: tb })).status).toBe(400) // once only
+    expect((await rowOf(b))!.status).toBe('confirmed')
+    expect((await rowOf(maint))!.status).toBe('requested')
+    // Then the asker confirms from their own email.
+    expect(mail.map((m) => m.to)).toEqual([maint.email])
+    const ta = tokenFrom(mail[0]!.text)
+    // Not before it's confirmed.
+    await expect(payload.update({ collection: MEMBERS as never, id: (await rowOf(maint))!.id, data: { status: 'approved' } as never, user: other as never, overrideAccess: false })).rejects.toThrow(/confirmed/)
+    expect((await call('/hats/confirm', null, { token: ta })).status).toBe(200)
+    expect((await call('/hats/confirm', null, { token: ta })).status).toBe(400) // once only
+    expect((await rowOf(maint))!.status).toBe('confirmed')
+    const row = async () => (await rowOf(b))!
 
     // The approver is in the set: refused, so the owner's own links need someone else.
     await expect(payload.update({ collection: MEMBERS as never, id: (await row()).id, data: { status: 'approved' } as never, user: maint as never, overrideAccess: false })).rejects.toThrow(/belong to/)
@@ -335,16 +365,20 @@ describe('linking', () => {
     const token = await login(a.email!)
     const answers = [await call('/hats/link', token, { email: 'nobody@example.invalid' }), await call('/hats/link', token, { email: taken.email }), await call('/hats/link', token, { email: a.email })]
     for (const r of answers) expect([r.status, r.body.message]).toEqual([202, answers[0]!.body.message])
-    expect(mail).toHaveLength(0)
+    // Only the asker's own note, the same each time, with no token.
+    expect(mail.map((m) => m.to)).toEqual([a.email, a.email, a.email])
+    expect(new Set(mail.map((m) => m.text)).size).toBe(1)
+    expect(tokenFrom(mail[0]!.text)).toBe('')
 
     const fresh = await make(email('fresh'), 'member')
     await call('/hats/link', token, { email: fresh.email })
-    // The requester's own menu doesn't show the other account until its owner confirms it.
-    expect((await call('/hats', token, undefined, 'get')).body.set.map((m: { label: string }) => m.label)).toEqual([a.email])
+    // The requester's own menu shows nothing until the other account confirms.
+    expect((await call('/hats', token, undefined, 'get')).body.set).toEqual([])
     const t = tokenFrom(mail.find((m) => m.to === fresh.email)!.text)
-    const row = (await payload.find({ collection: MEMBERS as never, where: { user: { equals: fresh.id } }, overrideAccess: true })).docs[0]!
-    await payload.update({ collection: MEMBERS as never, id: row.id, data: { tokenExpires: new Date(Date.now() - 1000).toISOString() } as never, overrideAccess: true, context: { hatsInternal: true } })
+    const req = (await payload.find({ collection: REQUESTS as never, where: { account: { equals: fresh.id } }, overrideAccess: true })).docs[0]!
+    await payload.update({ collection: REQUESTS as never, id: req.id, data: { expiresAt: new Date(Date.now() - 1000).toISOString() } as never, overrideAccess: true })
     expect((await call('/hats/confirm', null, { token: t })).status).toBe(400)
+    expect((await payload.find({ collection: MEMBERS as never, where: { user: { in: [a.id, fresh.id] } }, overrideAccess: true })).totalDocs).toBe(0)
   })
 
   it('refuses link requests the site’s limit refuses, and when the limit itself fails, sending nothing', async () => {
@@ -411,8 +445,9 @@ describe('switching accounts', () => {
     const stranger = await make(email('s'), 'admin')
     expect((await call('/hats/switch', await login(a.email!), { account: stranger.id, hat: 'member' })).status).toBe(403)
     const c = await make(email('c'), 'member')
+    mail.length = 0
     await call('/hats/link', await login(a.email!), { email: c.email })
-    for (const m of [...mail]) await call('/hats/confirm', null, { token: tokenFrom(m.text) })
+    await confirmAll()
     expect((await call('/hats/switch', await login(a.email!), { account: c.id, hat: 'member' })).status).toBe(403)
   })
 
@@ -532,7 +567,7 @@ describe('only an exact true from the site’s checks', () => {
     const a = await make(email('a'), 'member')
     const b = await make(email('b'), 'member')
     expect((await call('/hats/link', await login(a.email!), { email: b.email })).status).toBe(202)
-    for (const m of [...mail]) expect((await call('/hats/confirm', null, { token: tokenFrom(m.text) })).status).toBe(200)
+    await confirmAll()
     const row = async () => (await payload.find({ collection: MEMBERS as never, where: { user: { equals: b.id } }, overrideAccess: true })).docs[0]!
 
     for (const [what, answer] of NOT_TRUE) {
@@ -1225,5 +1260,263 @@ describe('a gain-based stepUpWhen across a person\'s set', () => {
     } finally {
       restore()
     }
+  })
+})
+
+describe('a link request answers the same way whatever the address', () => {
+  const OPTS = () => payload.config.custom!.hats as ResolvedHatsOptions
+  const WRITES = ['create', 'updateOne', 'updateMany', 'deleteOne', 'deleteMany', 'upsert'] as const
+
+  /** Counts database writes per kind and collection while `fn` runs. */
+  async function countWrites<T>(fn: () => Promise<T>) {
+    const db = payload.db as unknown as Record<string, (args: { collection: string }) => Promise<unknown>>
+    const saved = WRITES.map((k) => [k, db[k]!] as const)
+    const counts: Record<string, number> = {}
+    for (const [k, original] of saved)
+      db[k] = function (this: unknown, args: { collection: string }) {
+        counts[`${k} ${args.collection}`] = (counts[`${k} ${args.collection}`] ?? 0) + 1
+        return original.call(this, args)
+      }
+    try {
+      return { result: await fn(), counts }
+    } finally {
+      for (const [k, original] of saved) db[k] = original
+    }
+  }
+
+  /** What the asker could read, with their own id and address masked, so branches compare directly. */
+  async function readable(asker: U, token: string) {
+    const mask = (v: unknown) => JSON.stringify(v).replaceAll(String(asker.id), 'ASKER-ID').replaceAll(String(asker.email), 'ASKER')
+    const local = async (collection: string) => {
+      try {
+        const r = await payload.find({ collection: collection as never, user: asker as never, overrideAccess: false, depth: 0 })
+        return `rows ${r.totalDocs}`
+      } catch (error) {
+        return `refused ${(error as { status?: number }).status}`
+      }
+    }
+    return {
+      menu: mask((await call('/hats', token, undefined, 'get')).body),
+      members: await local(MEMBERS),
+      links: await local('hat-links'),
+      requests: await local(REQUESTS),
+    }
+  }
+
+  /** The kinds of address a person might type: every one must look the same from the asker's side. */
+  const BRANCHES: Record<string, (asker: U) => Promise<string>> = {
+    missing: async () => email('nobody'),
+    existing: async () => (await make(email('t'), 'member')).email!,
+    locked: async () => {
+      const t = await make(email('t'), 'member')
+      await payload.db.updateOne({ collection: 'users', id: t.id, data: { lockUntil: new Date(Date.now() + 3_600_000).toISOString(), loginAttempts: 9 }, returning: false })
+      return t.email!
+    },
+    unverified: async () => {
+      const t = await make(email('t'), 'member')
+      await payload.db.updateOne({ collection: 'users', id: t.id, data: { _verified: false }, returning: false })
+      return t.email!
+    },
+    linked: async () => {
+      const t = await make(email('t'), 'member')
+      await link(t, await make(email('x'), 'member'), await make(email('maint'), 'admin', { maintainer: true }))
+      return t.email!
+    },
+    pending: async () => {
+      const t = await make(email('t'), 'member')
+      await call('/hats/link', await login((await make(email('other'), 'member')).email!), { email: t.email })
+      return t.email!
+    },
+    minor: async () => (await make(email('t'), 'member', { minorUntil: new Date(Date.now() + 5 * 365 * 86_400_000).toISOString() } as Partial<U>)).email!,
+    self: async (asker) => asker.email!,
+  }
+
+  /** Everything the asker can observe about one request, and a second one to the same address. */
+  async function observe(kind: string) {
+    const asker = await make(email('asker'), 'member')
+    const target = await BRANCHES[kind]!(asker)
+    const token = await login(asker.email!)
+    const out: unknown[] = []
+    for (const round of [1, 2]) {
+      mail.length = 0
+      const { result, counts } = await countWrites(() => call('/hats/link', token, { email: target }))
+      const own = mail.filter((m) => m.to === asker.email).map((m) => m.text.replaceAll(String(asker.email), 'ASKER'))
+      const pending = (await payload.count({ collection: REQUESTS as never, where: { requestedBy: { equals: asker.id } }, overrideAccess: true })).totalDocs
+      out.push({ round, status: result.status, body: result.body, own, writes: counts, pending, read: await readable(asker, token) })
+    }
+    return out
+  }
+
+  it('gives the same answer, asker email, readable records, database writes and pending count for every kind of address', async () => {
+    await observe('existing') // warm-up: clears expired rows and loads every code path once
+    const seen: Record<string, unknown> = {}
+    for (const kind of Object.keys(BRANCHES)) seen[kind] = await observe(kind)
+    for (const kind of Object.keys(BRANCHES)) expect(seen[kind], kind).toEqual(seen.missing)
+    // And what they all look like: a 202, one note to the asker, one request record each time, nothing readable.
+    expect(seen.missing).toMatchObject([
+      { status: 202, own: [expect.any(String)], writes: { [`create ${REQUESTS}`]: 1 }, pending: 1, read: { members: 'refused 403', links: 'refused 403', requests: 'refused 403' } },
+      { status: 202, pending: 2 },
+    ])
+  })
+
+  it('reaches the same pending limit after the same number of requests, whatever the address', async () => {
+    const reach = async (kind: string) => {
+      const asker = await make(email('asker'), 'member')
+      const target = await BRANCHES[kind]!(asker)
+      const token = await login(asker.email!)
+      const statuses: number[] = []
+      for (let i = 0; i <= OPTS().maxLinked * 2; i++) statuses.push((await call('/hats/link', token, { email: target })).status)
+      return statuses
+    }
+    const missing = await reach('missing')
+    expect(missing.at(-1)).toBe(429)
+    expect(missing.filter((s) => s === 202)).toHaveLength(OPTS().maxLinked * 2)
+    expect(await reach('existing')).toEqual(missing)
+  })
+
+  it('answers no sooner than linkAnswerMs, and doesn’t wait for a slow, hanging or failing invitation', async () => {
+    const opts = OPTS()
+    const saved = { send: opts.sendEmail, ms: opts.linkAnswerMs }
+    let release: () => void = () => {}
+    try {
+      opts.linkAnswerMs = 250 // read on every request, so a site can change it
+      for (const mode of ['ok', 'slow', 'hang', 'fail'] as const) {
+        const asker = await make(email('asker'), 'member')
+        const target = await make(email('t'), 'member')
+        let inviteDone = false
+        opts.sendEmail = async ({ to, text }) => {
+          if (to === target.email && mode !== 'ok') {
+            if (mode === 'fail') throw new Error('mail server down')
+            await new Promise<void>((resolve) => {
+              release = resolve
+              if (mode === 'slow') setTimeout(resolve, 1500)
+            })
+            inviteDone = true
+          }
+          mail.push({ to, text })
+        }
+        const token = await login(asker.email!)
+        const timed = async (to: string) => {
+          mail.length = 0
+          const start = performance.now()
+          const res = await call('/hats/link', token, { email: to })
+          return { res, ms: performance.now() - start, own: mail.filter((m) => m.to === asker.email).length }
+        }
+        const real = await timed(target.email!)
+        expect(real.ms, mode).toBeGreaterThanOrEqual(245)
+        expect(inviteDone, `${mode}: answered before the invitation finished`).toBe(false)
+        const fake = await timed(email('nobody'))
+        expect(fake.ms, mode).toBeGreaterThanOrEqual(245)
+        expect([real.res.status, real.res.body, real.own], mode).toEqual([fake.res.status, fake.res.body, fake.own])
+        if (mode === 'fail') {
+          // An invitation that never went out leaves a request whose token can never be used.
+          const r = (await payload.find({ collection: REQUESTS as never, where: { requestedBy: { equals: asker.id } }, overrideAccess: true, showHiddenFields: true, sort: 'createdAt' })).docs[0] as unknown as { account?: unknown; tokenHash?: unknown }
+          expect([r.account ?? null, r.tokenHash ?? null]).toEqual([null, null])
+        }
+        release()
+      }
+    } finally {
+      release()
+      opts.sendEmail = saved.send
+      opts.linkAnswerMs = saved.ms
+    }
+  })
+
+  it('measures the answer time for a missing and an existing address (reported, not asserted)', async () => {
+    const opts = OPTS()
+    const saved = opts.linkAnswerMs
+    const median = (xs: number[]) => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)]!
+    const run = async (kind: 'missing' | 'existing') => {
+      const times: number[] = []
+      for (let i = 0; i < 9; i++) {
+        const asker = await make(email('asker'), 'member')
+        const to = await BRANCHES[kind]!(asker)
+        const token = await login(asker.email!)
+        const start = performance.now()
+        await call('/hats/link', token, { email: to })
+        times.push(performance.now() - start)
+      }
+      return median(times)
+    }
+    try {
+      const report: Record<string, string> = {}
+      for (const ms of [saved, 0]) {
+        opts.linkAnswerMs = ms
+        await run('existing') // warm-up
+        report[`linkAnswerMs ${ms}`] = `missing ${(await run('missing')).toFixed(1)} ms, existing ${(await run('existing')).toFixed(1)} ms`
+      }
+      console.log('hats link answer medians:', JSON.stringify(report))
+    } finally {
+      opts.linkAnswerMs = saved
+    }
+  })
+})
+
+describe('confirming a link request fails closed', () => {
+  const requestFrom = async (asker: U, target: U) => {
+    mail.length = 0
+    expect((await call('/hats/link', await login(asker.email!), { email: target.email })).status).toBe(202)
+    return tokenFrom(mail.find((m) => m.to === target.email)!.text)
+  }
+  const rowsOf = async (...us: U[]) => (await payload.find({ collection: MEMBERS as never, where: { user: { in: us.map((u) => u.id) } }, overrideAccess: true })).totalDocs
+
+  it('refuses a request token for an address that got no invitation, or one already in a set', async () => {
+    const asker = await make(email('a'), 'member')
+    const token = 'made-up-token-for-a-request-with-no-account'
+    await payload.create({ collection: REQUESTS as never, data: { requestedBy: asker.id, account: null, tokenHash: hashToken(token), expiresAt: new Date(Date.now() + 3_600_000).toISOString() } as never, overrideAccess: true })
+    expect((await call('/hats/confirm', null, { token })).status).toBe(400)
+
+    const target = await make(email('t'), 'member')
+    const t = await requestFrom(asker, target)
+    // Meanwhile the target joins someone else's set.
+    await link(target, await make(email('x'), 'member'), await make(email('maint'), 'admin', { maintainer: true }))
+    expect((await call('/hats/confirm', null, { token: t })).status).toBe(400)
+    expect(await rowsOf(asker)).toBe(0)
+  })
+
+  it('refuses a confirmation that would take the set past maxLinked', async () => {
+    const approver = await make(email('maint'), 'admin', { maintainer: true })
+    const [a, b, c, d, e] = await Promise.all(['a', 'b', 'c', 'd', 'e'].map((x) => make(email(x), 'member')))
+    await link(a!, b!, approver)
+    await link(a!, c!, approver)
+    const td = await requestFrom(a!, d!)
+    const te = await requestFrom(a!, e!)
+    expect((await call('/hats/confirm', null, { token: td })).status).toBe(200)
+    expect((await call('/hats/confirm', null, { token: te })).status).toBe(400)
+    expect(await rowsOf(e!)).toBe(0)
+  })
+
+  it('refuses approving past maxLinked, however the rows got there', async () => {
+    const approver = await make(email('maint'), 'admin', { maintainer: true })
+    const people = await Promise.all(['a', 'b', 'c', 'd', 'e'].map((x) => make(email(x), 'member')))
+    const ctx = { hatsInternal: true }
+    const set = await payload.create({ collection: 'hat-links' as never, data: { label: 'made up' } as never, overrideAccess: true, context: ctx })
+    const rows = []
+    for (const [i, p] of people.entries())
+      rows.push(await payload.create({ collection: MEMBERS as never, data: { link: set.id, user: p.id, status: i < 4 ? 'approved' : 'confirmed' } as never, overrideAccess: true, context: ctx }))
+    await expect(payload.update({ collection: MEMBERS as never, id: rows[4]!.id, data: { status: 'approved' } as never, user: approver as never, overrideAccess: false })).rejects.toThrow(/at most 4/)
+  })
+
+  it('hides an asker who hasn’t confirmed from the invited account, and refuses unlinking them', async () => {
+    const asker = await make(email('a'), 'member')
+    const invited = await make(email('b'), 'member')
+    expect((await call('/hats/confirm', null, { token: await requestFrom(asker, invited) })).status).toBe(200)
+    const token = await login(invited.email!)
+    expect((await call('/hats', token, undefined, 'get')).body.set.map((m: { label: string }) => m.label)).toEqual([invited.email])
+    const res = await call('/hats/unlink', token, { account: String(asker.id) })
+    expect([res.status, res.body.data?.reason]).toEqual([404, 'notInSet'])
+    expect(await rowsOf(asker)).toBe(1)
+  })
+
+  it('removes link requests when either account is deleted', async () => {
+    const asker = await make(email('a'), 'member')
+    const target = await make(email('t'), 'member')
+    const other = await make(email('o'), 'member')
+    await requestFrom(asker, target)
+    await requestFrom(other, asker)
+    const left = async () => (await payload.count({ collection: REQUESTS as never, where: { or: [{ requestedBy: { equals: asker.id } }, { account: { equals: asker.id } }] }, overrideAccess: true })).totalDocs
+    expect(await left()).toBe(2)
+    await payload.delete({ collection: 'users', id: asker.id, overrideAccess: true })
+    expect(await left()).toBe(0)
   })
 })

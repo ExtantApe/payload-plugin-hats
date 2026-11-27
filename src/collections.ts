@@ -3,7 +3,7 @@ import { APIError, type CollectionConfig, type PayloadRequest } from 'payload'
 import { exactlyTrue } from './access.js'
 import { dissolveIfAlone, revokeSessions } from './sessions.js'
 import { hatsStateOf, idOf } from './state.js'
-import { LINKS, MEMBERS, SESSIONS, type HatsUser, type ResolvedHatsOptions } from './types.js'
+import { LINKS, MEMBERS, REQUESTS, SESSIONS, type HatsUser, type ResolvedHatsOptions } from './types.js'
 
 const internal = (req: PayloadRequest) => req.context?.hatsInternal === true
 
@@ -89,6 +89,14 @@ export function hatCollections(opts: ResolvedHatsOptions): CollectionConfig[] {
             req,
           })
           if (mine.totalDocs > 0) throw new APIError('You can’t approve a set you belong to. Ask another administrator.', 403, undefined, true)
+          // The size limit holds at approval too, whatever happened before: a set never has more approved accounts than maxLinked.
+          const approved = await req.payload.count({
+            collection: MEMBERS,
+            where: { and: [{ link: { equals: idOf(originalDoc.link) } }, { status: { equals: 'approved' } }, { id: { not_equals: originalDoc.id } }] },
+            overrideAccess: true,
+            req,
+          })
+          if (approved.totalDocs + 1 > opts.maxLinked) throw new APIError(`A set can hold at most ${opts.maxLinked} accounts.`, 400, undefined, true)
           return { ...data, approvedBy: me.id, approvedAt: new Date().toISOString() }
         },
       ],
@@ -128,5 +136,20 @@ export function hatCollections(opts: ResolvedHatsOptions): CollectionConfig[] {
     ],
   }
 
-  return [links, members, sessions]
+  // A link request waiting for the other account to confirm. Nobody reads or writes these but the plugin, so the
+  // person asking can't tell from them whether the address they gave has an account. One is written for every
+  // request, whatever the address; `account` is set only when an invitation was sent.
+  const requests: CollectionConfig = {
+    slug: REQUESTS,
+    admin: { hidden: true },
+    access: { read: never, create: never, update: never, delete: never },
+    fields: [
+      { name: 'requestedBy', type: 'relationship', relationTo: opts.users as never, required: true, index: true },
+      { name: 'account', type: 'relationship', relationTo: opts.users as never, index: true },
+      { name: 'tokenHash', type: 'text', index: true },
+      { name: 'expiresAt', type: 'date', required: true, index: true },
+    ],
+  }
+
+  return [links, members, sessions, requests]
 }

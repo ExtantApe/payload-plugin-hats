@@ -138,7 +138,30 @@ export async function runSwitch(req: PayloadRequest, input: SwitchInput | null |
   }
 }
 
+/** The origins this site answers as: the one the request arrived on, and the configured server URL. */
+function ownOrigins(req: PayloadRequest): string[] {
+  const out: string[] = []
+  for (const u of [req.url, req.payload?.config?.serverURL]) {
+    try {
+      if (u) out.push(new URL(u).origin)
+    } catch {
+      /* an unreadable address adds no origin, so a mismatch is refused */
+    }
+  }
+  return out
+}
+
+/** A switch only comes from the site's own POST: any other method, a foreign Origin or a Sec-Fetch-Site other than same-origin is refused. */
+function refuseCrossSite(req: PayloadRequest) {
+  if (String(req.method ?? '').toUpperCase() !== 'POST') refuse('Switching needs a POST from this site.', 405, 'notPost')
+  const origin = req.headers?.get?.('origin')
+  if (origin != null && !ownOrigins(req).includes(origin)) refuse('Switching must come from this site.', 403, 'crossSite')
+  const fetchSite = req.headers?.get?.('sec-fetch-site')
+  if (fetchSite != null && fetchSite !== 'same-origin') refuse('Switching must come from this site.', 403, 'crossSite')
+}
+
 async function switchCore(req: PayloadRequest, body: SwitchInput): Promise<SwitchResult> {
+  refuseCrossSite(req)
   const { opts, full, state, person } = await actor(req)
   await blockedReason(req, opts)
   const current = String(full.id)
@@ -151,6 +174,9 @@ async function switchCore(req: PayloadRequest, body: SwitchInput): Promise<Switc
   }
   const target = to === current ? full : await loadUser(req, to)
   if (!target) refuse('That account isn’t linked to this one.', 403, 'notLinked')
+  // Direct login refuses a locked account, so a switch into one is refused too.
+  const lockUntil = to === current ? null : (target as { lockUntil?: unknown }).lockUntil
+  if (lockUntil != null && new Date(lockUntil as string).getTime() > Date.now()) refuse('That account is locked. Try again later.', 403, 'locked')
   const { linked } = await linkedAccounts(req, current)
   if (!(opts.showSwitch ?? defaultShow)({ user: full, hats: opts.hatsOf(full), linked })) refuse('Switching isn’t available for this account.', 403, 'notAvailable')
 

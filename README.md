@@ -85,19 +85,27 @@ Every word is replaceable for translation: pass `text` (see `defaultText`) to `H
 `switchSession(req, { account, hat, code })` does what `POST /api/hats/switch` does, so a site can switch someone from its own route or screen without the picker. Both call the same function, so they answer the same and set the same cookie.
 
 ```ts
+// app/api/enter-admin/route.ts (Next.js). Your own POST route, not the picker.
+import { getPayload, type PayloadRequest } from 'payload'
+import config from '@payload-config'
 import { switchSession } from '@extantape/payload-plugin-hats'
 
 export async function POST(request: Request) {
-  // Check the Origin header against your own site first, then sign the request in as the person (payload.auth).
+  const payload = await getPayload({ config })
+  const { user } = await payload.auth({ headers: request.headers }) // the person's own sign-in cookie
+  if (!user) return Response.json({ reason: 'signIn' }, { status: 401 })
+  const { account, hat, code } = await request.json() // ids from your own screen; code only when it asked for one
+  // The plugin reads method, Origin and Sec-Fetch-Site from this request and refuses a cross-site call.
+  const req = { payload, user, headers: request.headers, method: request.method, url: request.url } as unknown as PayloadRequest
   const result = await switchSession(req, { account, hat, code })
-  if (!result.ok) return Response.json({ reason: result.reason }, { status: result.status }) // reason: needsCode, wrongCode, blocked, notLinked ...
+  if (!result.ok) return Response.json({ reason: result.reason }, { status: result.status }) // needsCode, wrongCode, blocked, notLinked, locked ...
   return new Response(null, { status: 204, headers: result.cookie ? { 'Set-Cookie': result.cookie } : {} })
 }
 ```
 
-- It acts only for `req.user`. With nobody signed in it is refused (`signIn`, 401). It has no option that skips a check: `blocked`, `notLinked`, `showSwitch` (`notAvailable`), the step-up checks, the session record and the old session's revoke all run, in the endpoint's order.
+- It acts only for `req.user`. With nobody signed in it is refused (`signIn`, 401), and so is a switch into an account that is locked (`locked`, 403), as direct sign-in is. It has no option that skips a check: `blocked`, `notLinked`, `showSwitch` (`notAvailable`), the step-up checks, the session record and the old session's revoke all run, in the endpoint's order.
 - It returns `{ ok: true, account, hat, cookie }` or `{ ok: false, status, reason, message }`. `cookie` is the `Set-Cookie` value for the new session, or `null` when the hat changed on the same account. The reasons are the endpoint's, `needsCode` included. It doesn't throw for a refusal, and an error from one of your hooks, or any other error inside the switch, is a refusal (`failed`, 500). A switch is never let through by a failing check.
-- **Call it only from a same-origin POST, never from a GET.** A link on another site can send someone to a GET, and `SameSite=Lax` sends the sign-in cookie on that top-level request, so a GET that switches would move them into a stronger account whenever a code is still remembered. Opening `/admin` may show an Enter admin screen with a button, and the code field when one is needed. The button posts. Nothing switches on the page load. The plugin can't see the method or the origin you called it from, so this check is yours.
+- **Call it only from a same-origin POST, never from a GET.** A link on another site can send someone to a GET, and `SameSite=Lax` sends the sign-in cookie on that top-level request, so a GET that switches would move them into a stronger account whenever a code is still remembered. Opening `/admin` may show an Enter admin screen with a button, and the code field when one is needed. The button posts. Nothing switches on the page load. `switchSession` checks this itself, and fails closed: it refuses (`notPost`, 405) unless `req.method` is POST, and refuses (`crossSite`, 403) when an `Origin` header is present and isn't this site's own origin (the request's URL or Payload's `serverURL`), or when `Sec-Fetch-Site` is present and isn't `same-origin`. The request you pass must carry the method, headers and URL, as in the sample. Also set `csrf` in your Payload config to your site's origins, so Payload's own cookie sign-in checks the same list.
 - Going back down to the account the person signed in with needs no new sign-in: the session's `via` keeps that account. With a gain-based `stepUpWhen` going down asks for no code. That holds while the link is approved and `blocked()` allows it. Unlinking, losing the role or deleting the account ends switched sessions, and the person signs in again. `onEvent`'s `switched` carries `via`, so admin work stays recorded against the staff account.
 - For one code per sitting across a person's accounts, use a gain-based `stepUpWhen` with `stepUp.rememberPer: 'set'`, and don't set `sensitive` on those hats. One code covers the whole set for `stepUp.rememberMinutes` (default 180), then it asks again. The plugin offers no "first entry ever": the expiry is what makes step-up worth having.
 

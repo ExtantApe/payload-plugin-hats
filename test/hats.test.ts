@@ -53,6 +53,7 @@ async function call(path: string, token: string | null, body: unknown = {}, meth
   const req = (await createLocalReq({ user: (user ?? undefined) as never }, payload)) as PayloadRequest
   if (!user) req.user = null
   ;(req as { headers: Headers }).headers = new Headers({ 'content-type': 'application/json' })
+  ;(req as { method: string }).method = 'POST'
   ;(req as { url: string }).url = `https://site.example/api${path}`
   req.data = body as never
   ;(req as unknown as { json: () => Promise<unknown> }).json = async () => body
@@ -795,6 +796,7 @@ describe('switchSession and the endpoint share one switch', () => {
     if (!user) req.user = null
     ;(req as { headers: Headers }).headers = new Headers({ 'content-type': 'application/json' })
     ;(req as { url: string }).url = 'https://site.example/api/hats/switch'
+    ;(req as { method: string }).method = 'POST'
     req.data = body as never
     return req
   }
@@ -823,6 +825,54 @@ describe('switchSession and the endpoint share one switch', () => {
     await link(a, b, approver)
     return { a, b }
   }
+
+  describe('refuses a switch that did not come from the site\'s own POST', () => {
+    const cases: [string, { method?: string; headers?: Record<string, string> }, string][] = [
+      ['a GET', { method: 'GET' }, 'notPost'],
+      ['a missing method', { method: '' }, 'notPost'],
+      ['a foreign Origin', { headers: { origin: 'https://evil.example' } }, 'crossSite'],
+      ['a cross-site Sec-Fetch-Site', { headers: { 'sec-fetch-site': 'cross-site' } }, 'crossSite'],
+      ['a same-site (sibling) Sec-Fetch-Site', { headers: { 'sec-fetch-site': 'same-site' } }, 'crossSite'],
+      ['a GET with a foreign Origin and cross-site Sec-Fetch-Site', { method: 'GET', headers: { origin: 'https://evil.example', 'sec-fetch-site': 'cross-site' } }, 'notPost'],
+    ]
+    for (const [name, mod, reason] of cases)
+      it(`${name}`, async () => {
+        const admin = await make(email('admin'), 'admin')
+        const token = await login(admin.email!)
+        const req = await reqFor(token)
+        ;(req as { method: string }).method = mod.method ?? 'POST'
+        for (const [k, v] of Object.entries(mod.headers ?? {})) req.headers.set(k, v)
+        const r = await switchSession(req, { hat: 'member' })
+        expect(r).toMatchObject({ ok: false, reason })
+        expect((await whoIs(token))!.level).toBe('admin') // nothing switched
+      })
+    it('lets the site\'s own origin and a same-origin Sec-Fetch-Site through', async () => {
+      const admin = await make(email('admin'), 'admin')
+      const req = await reqFor(await login(admin.email!))
+      req.headers.set('origin', 'https://site.example')
+      req.headers.set('sec-fetch-site', 'same-origin')
+      expect(await switchSession(req, { hat: 'member' })).toMatchObject({ ok: true })
+    })
+  })
+
+  it('refuses an account that is locked, and lets it in once the lock has passed', async () => {
+    const { a, b } = await pair2()
+    await payload.update({ collection: 'users', id: b.id, data: { lockUntil: new Date(Date.now() + 600_000).toISOString() } as never, overrideAccess: true, showHiddenFields: true } as never)
+    const locked = await both(() => login(a.email!), { account: b.id, hat: 'curator', code: '444444' })
+    for (const r of [locked.e, locked.f]) expect([r.ok, r.status, r.reason]).toEqual([false, 403, 'locked'])
+    await payload.update({ collection: 'users', id: b.id, data: { lockUntil: new Date(Date.now() - 1000).toISOString() } as never, overrideAccess: true, showHiddenFields: true } as never)
+    expect((await viaFunction(await login(a.email!), { account: b.id, hat: 'curator', code: '444444' })).ok).toBe(true)
+  })
+
+  it('refuses a request whose user is from another collection even with a valid session state', async () => {
+    const admin = await make(email('admin'), 'admin')
+    const token = await login(admin.email!)
+    const req = await reqFor(token)
+    expect(hatsStateOf(req.user as never)).toBeTruthy() // the state is there, so only the collection check can refuse
+    ;(req.user as { collection: string }).collection = 'staff'
+    expect(await switchSession(req, { hat: 'member' })).toMatchObject({ ok: false, status: 401, reason: 'signIn' })
+    expect((await whoIs(token))!.level).toBe('admin')
+  })
 
   it('is refused with no one signed in, and by an account that is not from the hats collection', async () => {
     const e = await viaEndpoint(null, { hat: 'member' })
@@ -1044,6 +1094,7 @@ describe('a gain-based stepUpWhen across a person\'s set', () => {
   const sw = async (token: string, input: Record<string, unknown>) => {
     const user = await whoIs(token)
     const req = (await createLocalReq({ user: user as never }, payload)) as PayloadRequest
+    ;(req as { method: string }).method = 'POST'
     return switchSession(req, input as never)
   }
 

@@ -7,12 +7,13 @@ Linked accounts and role hats for Payload. One person links their accounts and s
 ## What it does
 
 - **Linked accounts.** Up to 4 accounts per person. Linking needs both emails confirmed and an approver who isn't in the set. Unlinking is self-serve and immediate.
+- **A link request answers the same way whatever the address.** The asker gets the same answer, the same note by email, the same records to read and the same wait (`linkAnswerMs`, default 2000 ms) whether or not the address has an account, whatever state it is in. Only an account that can be linked is invited, one open invitation per account from everyone (a unique key in the database holds this, even for requests that arrive together), and nothing joins a set until it confirms. Then the asker confirms from their own email. Open requests live in a `hat-requests` collection that no user can read and only the plugin can write, at most `maxLinked × 2` per account.
 - **Hats.** Wearing a hat narrows the user before `req.user` exists, so every access rule follows it: admin, REST, GraphQL and the Local API with `req`. If narrowing fails, the request is signed out, never given full roles.
 - **Step-up.** Switching into a sensitive hat asks for that account's second factor, remembered for 180 minutes (`stepUp.rememberMinutes`) per account, or per linked set (see below).
 - **Step up on gain.** Pass `stepUpWhen` to decide for yourself when a switch asks for a code, in place of the `sensitive` flag. It gets the hat worn now (`from`) and the one it would become (`to`), each with the user as it would be worn, so a site can ask only when `to` holds a role or permission that `from` doesn't. Going down asks nothing, going up or sideways asks. Only an exact `false` skips the code. `true`, a throw or any other answer asks, so a broken check never lets a switch through.
 - **One code for the whole set.** `stepUp.rememberPer: 'set'` remembers a good code for every account in the same linked set, for the same 3 hours, so one two-step covers the person. The default, `'account'`, is unchanged. An account in no set is remembered on its own either way. `stepUp.available` and `stepUp.verify` also get `signedIn` (the account that actually signed in) and `set` (the linked set's id, or `null`), so a site can check against one two-step for the person. `user` stays the account being switched into.
-- **Revocation.** Unlinking, deleting a row, losing a role or deleting an account ends every session switched into or through it. Switched sessions also re-check their set on every request. An ended session's record is kept, marked revoked, so a session that Payload writes back by accident (two writes to an account's sessions at once) stays signed out. Old records are deleted once their Payload session is gone, at most 50 per switch.
-- **Link limits.** Pass `limit` to rate-limit link requests, per person and per email address. It must answer exactly `true` to allow one. Any other answer, or a throw, refuses the request with `tooMany` (429) and nothing is sent.
+- **Revocation.** Unlinking, deleting a row, losing a role or deleting an account ends every session switched into or through it. Switched sessions also re-check their set on every request. An ended session's record is kept, marked revoked, so a session that Payload writes back by accident (two writes to an account's sessions at once) stays signed out. Old records are deleted once their Payload session is gone, at most 50 per switch. A switched session whose signed-in account no longer exists is refused and ended, even if the clean-up after that account's delete didn't finish. If the database fails during that clean-up, or while an unlink dissolves a set, the call answers with an error. A single delete or unlink with a transaction is then undone; in other cases the account can be deleted with some of its link rows left (see the limits under Upgrading).
+- **Link limits.** Pass `limit` to rate-limit link requests. Key it by the email address as well as the person, so many accounts can't each ask for the same address. It must answer exactly `true` to allow one. Any other answer, or a throw, refuses the request with `tooMany` (429) and nothing is sent.
 
 Needs Payload sessions (`auth.useSessions`, on by default).
 
@@ -56,7 +57,7 @@ Endpoints, under the API route:
 
 - `GET /hats` lists the acting account, its hats and its linked accounts.
 - `POST /hats/switch { account?, hat, code? }` switches hat or account.
-- `POST /hats/link { email }` asks to link another account.
+- `POST /hats/link { email }` asks to link another account. It answers 202 after `linkAnswerMs` whatever the address. Set `linkAnswerMs` above your slowest email send: work still running when it's up carries on after the answer, which a host that stops work after a response would cut short.
 - `GET` and `POST /hats/confirm` handle the email confirmation.
 - `POST /hats/unlink { account? }` takes an account out of the set.
 
@@ -108,6 +109,33 @@ export async function POST(request: Request) {
 - **Call it only from a same-origin POST, never from a GET.** A link on another site can send someone to a GET, and `SameSite=Lax` sends the sign-in cookie on that top-level request, so a GET that switches would move them into a stronger account whenever a code is still remembered. Opening `/admin` may show an Enter admin screen with a button, and the code field when one is needed. The button posts. Nothing switches on the page load. `switchSession` checks this itself, and fails closed: it refuses (`notPost`, 405) unless `req.method` is POST, and refuses (`crossSite`, 403) when an `Origin` header is present and isn't this site's own origin (the request's URL or Payload's `serverURL`), or when `Sec-Fetch-Site` is present and isn't `same-origin`. The request you pass must carry the method, headers and URL, as in the sample. Also set `csrf` in your Payload config to your site's origins, so Payload's own cookie sign-in checks the same list.
 - Going back down to the account the person signed in with needs no new sign-in: the session's `via` keeps that account. With a gain-based `stepUpWhen` going down asks for no code. That holds while the link is approved and `blocked()` allows it. Unlinking, losing the role or deleting the account ends switched sessions, and the person signs in again. `onEvent`'s `switched` carries `via`, so admin work stays recorded against the staff account.
 - For one code per sitting across a person's accounts, use a gain-based `stepUpWhen` with `stepUp.rememberPer: 'set'`, and don't set `sensitive` on those hats. One code covers the whole set for `stepUp.rememberMinutes` (default 180), then it asks again. The plugin offers no "first entry ever": the expiry is what makes step-up worth having.
+
+## Upgrading from 0.4.0
+
+Sets already approved keep working, and requests still pending from 0.4.0 complete through their old links with the same confirmations and approval.
+
+**On MongoDB there is no database step.** The plugin's 0.4.0 collections keep exactly the indexes 0.4.0 built, so a site with `ensureIndexes: true` starts on a 0.4.0 database as it is. Payload builds the new `hat-requests` collection's indexes when it starts. If you've turned Mongoose's `autoIndex` off, build those yourself before link requests are made, including the unique one on `holds`.
+
+**On Postgres or SQLite**, run `payload migrate:create`, then `payload migrate`. The migration adds the `hat_requests` table, with its unique `holds` column, and makes `hat_link_members.user_id` and `hat_requests.requested_by_id` nullable so the database's foreign key can clear them while an account is deleted (the plugin removes those rows straight after and still requires both on every write). Schema push mode (`push: true`, the development default) can't move a 0.4.0 SQLite schema: it stops on the existing `hat_members_link_idx` index, so use a migration there too. In 0.4.0 on SQL databases linking didn't work (ids were written as strings) and deleting a linked account failed; both work now.
+
+Everything else that changes for a host, in full:
+
+1. Regenerate types with `payload generate:types` (new `hat-requests` collection, new export `REQUESTS`).
+2. Review a custom `reasons.linkSent` text: it shouldn't name the address.
+3. Link requests answer 202 after `linkAnswerMs` (new option, 2000 ms by default). A value outside 0 to 2147483647, or one that isn't a number, stops startup.
+4. In an `onEvent` handler, use `by` for the asker on `link-requested`. It fires at ask time only when the asker is already in a set. Otherwise it fires as the other account confirms, just before `link-confirmed`, on that request: `req.user` there may be nobody, or the invited person, who may be a child.
+5. A handler that throws on `link-requested`, `link-confirmed`, `unlinked` or `sessions-revoked` is logged by a short error name and skipped, and what it reported still happened. The plugin waits at most 2 seconds for each of those handlers.
+6. Key `limit` by address as well as person.
+7. Startup refuses a config that already has a `hat-requests` collection.
+8. A `hatsInternal` or `hatsDissolving` key in `context` means nothing.
+9. `confirmURL`, `sendEmail` and `onEvent` run without the plugin's mark, and so do your own hooks and other plugins' hooks, on any collection and field. Their writes are checked like any other server write, so they can't write `hat-requests`.
+10. If your users collection has afterDelete hooks, the plugin's now runs first, and only for a delete that happened.
+11. `POST /hats/unlink` and `POST /hats/switch` take only an exact account id. Anything else, including the text `null`, is refused (`notInSet` on unlink, `notLinked` on switch) before any database query.
+12. A database failure during the plugin's clean-up after an account delete, during an unlink, or during an approver's delete of a member row now fails that call. For a single delete with a transaction the whole change is undone; for a bulk delete, or without a transaction, see the limits below.
+
+Limits to know about: with `autoIndex` off and no `holds` index, requests arriving together can each send an invitation. Don't call the link endpoint's handler inside a transaction your own code opened: a refused claim ends it. Anyone signed in can hold an account's one open invitation until it expires (`confirmHours`), which delays other invitations to that account. Without transactions, a database failure part way through an account's clean-up leaves the account deleted and some of its rows behind; sessions through it are still refused. In a bulk delete on MongoDB with transactions, one account's failed clean-up ends Payload's shared transaction: the error is reported, but that account itself is still deleted, with its member row, set, requests and session record left behind (sessions through it stay refused), and the other accounts in the call can be deleted too. Delete linked accounts one at a time.
+
+The changelog lists every change.
 
 ## Commands
 

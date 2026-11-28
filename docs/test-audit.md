@@ -2,6 +2,52 @@
 
 Newest first.
 
+## 2026-11-27 (review round five): 0.4.0 databases, injected failures, foreign hooks
+
+- New promises: a MongoDB database left by 0.4.0 starts with `ensureIndexes: true` and keeps every index; a database failure in the clean-up after an account delete, in an unlink or in an approver's member delete answers with an error (a single delete with a transaction is undone; a bulk one can leave the failing account's rows, a documented limit); a switched session whose signed-in account is gone is refused; no hook outside the plugin's own runs with its mark; switch and unlink refuse the text `null`.
+- Covered: `test/upgrade.test.ts` (2 cases, MongoDB only): the 0.4.0 index set, captured from a database 0.4.0 started on, built with the driver, then this build started on it and every index compared; a switch, unlink and delete in a set written as 0.4.0 wrote it. `test/failures.test.ts` (12 cases, run on MongoDB with and without transactions and on SQLite): six injected failure points in the account clean-up, two in an unlink's dissolve, one in an approver's member delete, a switched session after its account is deleted straight from the database, `null` and `undefined` ids with a member row that has no account, and another plugin's member hook, a users read hook and a field read hook all trying to write `hat-requests`. On the previous commit 25 of the 26 MongoDB runs and 10 of the 12 SQLite runs fail.
+- Corrected: round four's 17 of 20 delete runs failing on the commit before it; a review rerun found 15, which is the reproducible count.
+- Gaps skipped: Postgres and `migrate:create` (no Postgres in the test setup); a real MongoDB server and `autoIndex` off (the index test builds indexes itself, and with `autoIndex` off building them is a host step); a failure injected in a bulk delete of several accounts (Payload's own bulk behavior, documented as a limit); the expiry sweep's errors (best effort by design, logged).
+
+## 2026-11-27 (review round four): deletes that fail or happen, handlers, marks, exact ids
+
+- New promises: a delete that doesn't happen changes no link records; a delete that happens leaves nothing pointing at a missing account or set, in bulk too; no event handler can block or undo an account delete; a site callback never leaves the plugin's mark on; unlink takes only an exact id.
+- Covered: `test/delete.test.ts` (10 cases, run on MongoDB with and without transactions, and on SQLite by hand): refused by another plugin, with `disableTransaction`, by access; bulk with one refused; bulk two of three and all three in one set; throwing and never-finishing `sessions-revoked` handler on a child's account; the site's afterDelete throwing; a plain single delete. An invariant check walks every row for references to missing accounts or sets. In `test/hats.test.ts`: two mark tests, exact-id unlink, a throwing `unlinked` handler. `test/numeric-ids.test.ts` now spies on what the plugin passes to Payload. On the previous commit all four new main-suite tests fail, and 17 of the 20 delete runs; the three refusal runs that pass there stay as regression guards.
+- Corrected: the round-three line said the numeric-ids file proved the id type through Payload's relationship checks on MongoDB. It didn't: MongoDB accepts a string there, so it passed on the old code. The spy now fails on the commit before the fix.
+- Gaps skipped: a database failure in the middle of the clean-up (documented limit, needs fault injection in the adapter); Postgres; an approver's bulk delete of member rows (unchanged path, not part of this review).
+
+## 2026-11-27 (review round three): number ids, SQL deletes, handler bounds, the mark on callbacks
+
+- New promises: relationships hold the account's own id type; deleting an account works on SQL; a link event handler can't hang or 500 the confirm page; host callbacks never see the plugin's mark.
+- Covered: `test/numeric-ids.test.ts` (number-id users on in-memory MongoDB: request, both confirmations, the set and an account delete, plus `relId`; it only proved the id type once round four added the spy); in `test/hats.test.ts`, "a handler’s error has a name that throws", "handlers never finish", "without the plugin’s mark". The whole main suite also ran once by hand on SQLite (`HATS_DB=sqlite`), 79 passing, the MongoDB write-count test skipped.
+- Fixed: the flaky timing test now waits for the request's background work (`linkWorkSettled`), no longer a sleep.
+- Gaps skipped: Postgres and `payload migrate:create` (no server here; SQLite covers the id type and foreign keys); a startup check for the `holds` index with `autoIndex` off and calls inside a caller's transaction (documented limits, no code to test); a stranger holding an invitation (unchanged behavior, documented).
+
+## 2026-11-27 (review round two): concurrent requests, failing handlers, the plugin's mark
+
+Suite: 135 tests before, 138 after (same setup).
+
+- Promises: one open invitation per account holds when many requests arrive at once, kept by a unique `holds` key in the database; every request makes the same writes; a throwing `onEvent` handler can't turn a confirmation into an error, leave it half done or skip `link-confirmed`, and its log line carries no details; server code can't pass as the plugin through `context`.
+- Covered: "link requests after review": six concurrent askers over five rounds; throwing handlers on `link-requested` and `link-confirmed`, at confirmation and at ask time; string markers in `context` refused. The write-count test now expects a create and an update for every kind of address. All fail against the previous commit.
+- Gaps skipped (and why): a SQL adapter (no SQL adapter in the dev dependencies; the field is a plain unique text column); a real MongoDB deployment and `autoIndex` off (the in-memory replica set builds the same unique index).
+
+## 2026-11-27 (later): upgrading from 0.4.0, and the follow-up fixes
+
+Suite: 124 tests before, 135 after (same setup).
+
+- Promises: a site on 0.4.0 with linking on keeps its approved sets and pending requests working; 0.4.0 event handlers get the same shapes; one open invitation per account; only the plugin writes `hat-requests`; a deleted account frees no limit; a racing confirmation fails closed with a page, never a 500; `linkAnswerMs` stays a real wait; a confirmation can't land in a set the invitation came before.
+- Covered: "upgrading from 0.4.0 with linking on" (5 tests, on rows written the way 0.4.0 wrote them) and "link requests after review" (6 tests). Each new behavior fails against the previous commit.
+- Gaps skipped (and why): a SQL adapter migration (the collection is plain fields and Payload generates the table; worth one run on a throwaway SQLite before release); the admin screens and `LinkedAccounts` in a browser (unchanged code, and the client tests cover it); an age check (a design question, not built).
+
+## 2026-11-27: a link request answers the same way whatever the address
+
+Suite: 115 tests before, 124 after (`npx vitest run`, real Payload 3.92, in-memory MongoDB, made-up accounts).
+
+- Promises: the asker can't tell whether an address has an account, or what state it is in (missing, existing, locked, unverified, linked, waiting on another request, a minor, their own), from the answer, their emails, `GET /hats`, Local API reads with access on, the writes made, the open-request count, a second request, or the time taken; only an account that can be linked is invited; nothing joins a set before it confirms; request tokens work once, expire and are cleared when the invitation fails; no set passes `maxLinked` at confirmation or approval; an unconfirmed asker can't be unlinked or seen by the invited account; deleting an account removes its requests.
+- Covered: "a link request answers the same way whatever the address" (4 tests: the eight-branch comparison with write counts, the pending cap, the answer time with slow, hanging and failing sends, and a reported median) and "confirming a link request fails closed" (5 tests). The linking tests were updated for the new order. All 9 new tests fail against the previous code (checked on a scratch copy with the old `src`).
+- Timing is asserted by structure: no answer before `linkAnswerMs`, and the answer doesn't wait for an invitation still in flight. Wall clock is measured once and reported in the changelog, not asserted.
+- Gaps skipped (and why): GraphQL reads of `hat-requests` (its access is `never` on every operation, the same rule REST and Local API tests already prove); a real mail server and a serverless host (outside a unit suite; the README says to keep `linkAnswerMs` above the slowest send).
+
 ## 2026-11-22: stepUpWhen, the redesigned switch and the accessibility fixes (0.2.0 to 0.3.1)
 
 - Promises: only gaining roles asks for a code; `stepUpWhen` failing, rejecting or answering anything but false asks for a code, and a site with no second factor on that account still refuses; a code covers its own account unless `rememberPer` is set, then a set for three hours; `steppedUp` is reported only when a code was given; safe hats switch on a tap and sensitive ones confirm; the switch, the note and the account page meet WCAG 2.2 AA (live region present while empty, focus after Dismiss, Unlink and refusals, focus ring and border tokens for 1.4.11, a 32px minimum target for 2.5.8, no English defaults left when every text is replaced).

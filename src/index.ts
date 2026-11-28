@@ -3,7 +3,7 @@ import type { PayloadRequest, CollectionAfterChangeHook, CollectionAfterDeleteHo
 import { hatCollections } from './collections.js'
 import { hatEndpoints, runSwitch, type SwitchInput, type SwitchResult } from './endpoints.js'
 import { revokeSessions, wrapStrategies } from './sessions.js'
-import { asPlugin, newToken, relId, serial } from './state.js'
+import { asPlugin, changeWhere, newToken, ownHook, relId, removeWhere, serial, unmarkForeignHooks } from './state.js'
 import { LINKS, MEMBERS, REQUESTS, SESSIONS, type HatsOptions, type HatsUser, type ResolvedHatsOptions } from './types.js'
 
 export { hatsStateOf } from './state.js'
@@ -50,20 +50,26 @@ export const hats =
     for (const slug of ['hat-links', MEMBERS, SESSIONS, REQUESTS])
       if ((config.collections ?? []).some((c) => c.slug === slug)) throw new Error(`hats: a collection "${slug}" already exists.`)
 
+    // MongoDB keeps 0.4.0's schema and indexes exactly; only SQL adapters (every other adapter Payload ships) get the
+    // nullable account columns their foreign keys need.
+    const sql = (config.db as { name?: unknown } | undefined)?.name !== 'mongoose'
+
     const ids = (u: unknown) => new Set(opts.hatsOf(u as HatsUser).map((h) => h.id))
     // Losing a hat ends every session switched into the account: it comes back in through the switch, re-checked.
-    const afterChange: CollectionAfterChangeHook = async ({ doc, previousDoc, operation, req }) => {
+    const afterChange: CollectionAfterChangeHook = ownHook(async ({ doc, previousDoc, operation, req }) => {
       if (operation !== 'update' || !previousDoc) return doc
       const now = ids(doc)
       if ([...ids(previousDoc)].some((h) => !now.has(h))) await revokeSessions(req.payload, { and: [{ user: { equals: String(doc.id) } }, { via: { exists: true } }, { via: { not_equals: null } }] }, 'lost a role', req)
       return doc
-    }
+    })
     // Once an account is deleted, nothing of the plugin's points at it. This runs in afterDelete, so only for a delete
     // that happened: one refused or failed before it (a site hook, access, one document of a bulk delete) changes
     // nothing here. It runs before the site's own afterDelete hooks, inside the delete's transaction where there is
     // one. On SQL databases the foreign keys have already set these columns to null, so null rows go too. Payload runs
-    // a bulk delete's documents side by side; `serial` runs this one account at a time.
-    const afterDelete: CollectionAfterDeleteHook = async ({ id, req }) => {
+    // a bulk delete's documents side by side; `serial` runs this one account at a time. Any database failure in here
+    // throws, so the delete fails with it: with a transaction the whole delete is undone, and without one the caller
+    // still gets the error (a switched session through the deleted account is refused anyway, see `applyHat`).
+    const afterDelete: CollectionAfterDeleteHook = ownHook(async ({ id, req }) => {
       const p = req.payload
       const me = relId(p, opts.users, id)
       const mineOrGone = (field: string): Where => ({ or: [{ [field]: { equals: me } }, { [field]: { exists: false } }] })
@@ -71,23 +77,23 @@ export const hats =
         asPlugin(req, async () => {
           // One row at a time, so each leaving takes its set's members as they are at that moment.
           const rows = await p.find({ collection: MEMBERS as never, where: mineOrGone('user'), limit: 0, depth: 0, overrideAccess: true, pagination: false, req })
-          for (const r of rows.docs) await p.delete({ collection: MEMBERS as never, where: { id: { equals: r.id } }, overrideAccess: true, req })
-          await p.delete({ collection: REQUESTS as never, where: mineOrGone('requestedBy'), overrideAccess: true, req })
+          for (const r of rows.docs) await removeWhere(p, { collection: MEMBERS as never, where: { id: { equals: r.id } }, overrideAccess: true, req })
+          await removeWhere(p, { collection: REQUESTS as never, where: mineOrGone('requestedBy'), overrideAccess: true, req })
           // Requests to the account stay, emptied, until they expire: they still count toward the asker's limit, so
           // deleting an account frees nothing the asker could notice. At most one request holds the account.
-          await p.update({ collection: REQUESTS as never, where: { or: [{ account: { equals: me } }, { holds: { equals: `account:${String(id)}` } }] }, data: { account: null, holds: `none:${newToken()}`, tokenHash: null } as never, overrideAccess: true, req })
+          await changeWhere(p, { collection: REQUESTS as never, where: { or: [{ account: { equals: me } }, { holds: { equals: `account:${String(id)}` } }] }, data: { account: null, holds: `none:${newToken()}`, tokenHash: null } as never, overrideAccess: true, req })
           // Who started a set, added or approved an account: cleared, along with the set's label, which names them.
-          await p.update({ collection: LINKS as never, where: mineOrGone('requestedBy'), data: { requestedBy: null, label: 'Started by a deleted account' } as never, overrideAccess: true, req })
+          await changeWhere(p, { collection: LINKS as never, where: mineOrGone('requestedBy'), data: { requestedBy: null, label: 'Started by a deleted account' } as never, overrideAccess: true, req })
           for (const field of ['addedBy', 'approvedBy'])
-            await p.update({ collection: MEMBERS as never, where: { and: [{ [field]: { equals: me } }, { user: { exists: true } }] }, data: { [field]: null } as never, overrideAccess: true, req })
+            await changeWhere(p, { collection: MEMBERS as never, where: { and: [{ [field]: { equals: me } }, { user: { exists: true } }] }, data: { [field]: null } as never, overrideAccess: true, req })
         }),
       )
       await revokeSessions(p, { or: [{ user: { equals: String(id) } }, { via: { equals: String(id) } }] }, 'account deleted', req)
-    }
-    const afterLogout: CollectionAfterLogoutHook = async ({ req }) => {
+    })
+    const afterLogout: CollectionAfterLogoutHook = ownHook(async ({ req }) => {
       const sid = (req.user as HatsUser | null)?._sid
-      if (sid) await req.payload.update({ collection: SESSIONS as never, where: { sid: { equals: sid } }, data: { revokedAt: new Date().toISOString() } as never, overrideAccess: true, req })
-    }
+      if (sid) await changeWhere(req.payload, { collection: SESSIONS as never, where: { sid: { equals: sid } }, data: { revokedAt: new Date().toISOString() } as never, overrideAccess: true, req })
+    })
 
     const onInit = config.onInit
     return {
@@ -100,13 +106,13 @@ export const hats =
                 hooks: {
                   ...c.hooks,
                   afterChange: [...(c.hooks?.afterChange ?? []), afterChange],
-                                    afterDelete: [afterDelete, ...(c.hooks?.afterDelete ?? [])],
+                  afterDelete: [afterDelete, ...(c.hooks?.afterDelete ?? [])],
                   afterLogout: [...(c.hooks?.afterLogout ?? []), afterLogout],
                 },
               }
             : c,
         ),
-        ...hatCollections(opts),
+        ...hatCollections(opts, sql),
       ],
       endpoints: [...(config.endpoints ?? []), ...hatEndpoints],
       admin:
@@ -115,6 +121,7 @@ export const hats =
           : { ...config.admin, components: { ...config.admin?.components, actions: [...(config.admin?.components?.actions ?? []), '@extantape/payload-plugin-hats/client#HatSwitcher'] } },
       custom: { ...config.custom, hats: opts },
       onInit: async (payload) => {
+        unmarkForeignHooks(payload)
         await onInit?.(payload)
         wrapStrategies(payload, opts)
       },

@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { createHash, randomBytes } from 'node:crypto'
 
-import type { Payload, PayloadRequest } from 'payload'
+import type { Payload, PayloadRequest, Where } from 'payload'
 
 import type { HatsEvent, HatsState, HatsUser, ResolvedHatsOptions } from './types.js'
 
@@ -53,6 +53,68 @@ export async function withMark<T>(req: PayloadRequest, mark: Mark, fn: () => Pro
 
 /** Runs `fn` with the request marked as the plugin's own. */
 export const asPlugin = <T>(req: PayloadRequest, fn: () => Promise<T>): Promise<T> => withMark(req, INTERNAL, fn)
+
+/**
+ * Hooks the plugin owns. Every other hook (the site's, another plugin's), on any collection, runs with the marks
+ * off, so code that isn't the plugin's never acts as the plugin, even when a plugin write sets it off on the same
+ * request (an afterDelete another plugin put on `hat-members`, say).
+ */
+const own = new WeakSet<object>()
+const plain = new WeakSet<object>()
+export const ownHook = <T extends (...args: never[]) => unknown>(fn: T): T => {
+  own.add(fn)
+  return fn
+}
+
+type HookFn = (...args: unknown[]) => unknown
+function unmarkHook(fn: unknown): unknown {
+  if (typeof fn !== 'function' || own.has(fn) || plain.has(fn)) return fn
+  const wrapped = (...args: unknown[]) => marks.exit(() => (fn as HookFn)(...args))
+  plain.add(wrapped)
+  return wrapped
+}
+function unmarkHookLists(hooks: unknown) {
+  if (!hooks || typeof hooks !== 'object') return
+  const lists = hooks as Record<string, unknown>
+  for (const key of Object.keys(lists)) if (Array.isArray(lists[key])) lists[key] = (lists[key] as unknown[]).map(unmarkHook)
+}
+function unmarkFieldHooks(fields: unknown) {
+  if (!Array.isArray(fields)) return
+  for (const f of fields as Record<string, unknown>[]) {
+    if (!f || typeof f !== 'object') continue
+    unmarkHookLists(f.hooks)
+    unmarkFieldHooks(f.fields)
+    for (const b of (Array.isArray(f.blocks) ? f.blocks : []) as Record<string, unknown>[]) unmarkFieldHooks(b?.fields)
+    for (const t of (Array.isArray(f.tabs) ? f.tabs : []) as Record<string, unknown>[]) unmarkFieldHooks(t?.fields)
+  }
+}
+/** Wraps every hook that isn't the plugin's, in every collection, global and the config, to run with the marks off. */
+export function unmarkForeignHooks(payload: Payload) {
+  unmarkHookLists(payload.config.hooks)
+  const configs = [...payload.config.collections, ...(payload.config.globals ?? [])] as unknown as Record<string, unknown>[]
+  for (const c of configs) {
+    unmarkHookLists(c.hooks)
+    unmarkFieldHooks(c.fields)
+    unmarkFieldHooks(c.flattenedFields)
+  }
+}
+
+/**
+ * A bulk delete or update by `where` that throws when any row fails. Payload's bulk operations catch a row's error and
+ * return it in `errors`; with a transaction, the failure has usually ended the transaction already, so carrying on
+ * would report a change that was undone. The plugin's own bulk writes go through these.
+ */
+type ByWhere = { collection: unknown; where: Where; [key: string]: unknown }
+export async function removeWhere(payload: Payload, args: ByWhere) {
+  const result = (await payload.delete(args as never)) as unknown as { docs: unknown[]; errors?: unknown[] }
+  if (result.errors?.length) throw new Error(`Hats: ${result.errors.length} ${String(args.collection)} row(s) couldn't be removed.`)
+  return result
+}
+export async function changeWhere(payload: Payload, args: ByWhere & { data: unknown }) {
+  const result = (await payload.update(args as never)) as unknown as { docs: unknown[]; errors?: unknown[] }
+  if (result.errors?.length) throw new Error(`Hats: ${result.errors.length} ${String(args.collection)} row(s) couldn't be changed.`)
+  return result
+}
 
 /**
  * An id as a relationship to `slug` stores it: a number where that collection's ids are numbers (SQL adapters by

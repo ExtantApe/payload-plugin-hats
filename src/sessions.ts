@@ -1,6 +1,6 @@
 import type { AuthStrategy, Payload, PayloadRequest, Where } from 'payload'
 
-import { asPlugin, attachState, DISSOLVING, hatsOptions, idOf, tell, withMark } from './state.js'
+import { asPlugin, attachState, DISSOLVING, hatsOptions, idOf, relId, removeWhere, tell, withMark } from './state.js'
 import { LINKS, MEMBERS, SESSIONS, type Hat, type HatsState, type HatsUser, type ResolvedHatsOptions } from './types.js'
 
 type SessionDoc = { id: string; sid: string; user: string; via?: string | null; link?: string | null; hat?: string | null; steppedUp?: Record<string, string> | null; revokedAt?: string | null; expiresAt?: string | null }
@@ -50,9 +50,10 @@ export async function dissolveIfAlone(payload: Payload, link: string, req: Paylo
   if (docs.length > 1) return
   await withMark(req, DISSOLVING, () =>
     asPlugin(req, async () => {
-      // By id one at a time, and gone already is fine: an account's clean-up may have removed a row a moment ago.
-      for (const d of docs) await payload.delete({ collection: MEMBERS as never, where: { id: { equals: d.id } }, overrideAccess: true, req })
-      await payload.delete({ collection: LINKS as never, where: { id: { equals: link } }, overrideAccess: true, req })
+      // By id one at a time, and gone already is fine: an account's clean-up may have removed a row a moment ago. A
+      // row that fails to go throws, so the unlink or delete that set this off fails too, and isn't reported as done.
+      for (const d of docs) await removeWhere(payload, { collection: MEMBERS as never, where: { id: { equals: d.id } }, overrideAccess: true, req })
+      await removeWhere(payload, { collection: LINKS as never, where: { id: { equals: link } }, overrideAccess: true, req })
     }),
   )
   await revokeSessions(payload, { link: { equals: link } }, 'set dissolved', req)
@@ -69,9 +70,12 @@ export async function sharedLink(payload: Payload, a: string, b: string, req?: P
     pagination: false,
     req,
   })
-  const [x, y] = docs as unknown as { link: unknown; user: unknown }[]
+  // Only rows for exactly these two accounts count (on MongoDB a query for the text "null" can match a row whose
+  // account was cleared).
+  const rows = (docs as unknown as { link: unknown; user: unknown }[]).filter((d) => d.user != null && (idOf(d.user) === a || idOf(d.user) === b))
+  const [x, y] = rows
   if (a === b) return x ? idOf(x.link) : null
-  return x && y && idOf(x.link) === idOf(y.link) ? idOf(x.link) : null
+  return x && y && idOf(x.user) !== idOf(y.user) && idOf(x.link) === idOf(y.link) ? idOf(x.link) : null
 }
 
 /** The hat a session wears, from the account's current hats. A worn hat the account no longer has falls to the narrowest. */
@@ -96,6 +100,13 @@ export async function applyHat(payload: Payload, opts: ResolvedHatsOptions, user
     return null
   }
   if (s?.via) {
+    // The account this session was switched in through must still exist. If its delete failed partway (a database
+    // error without a transaction), its member row can outlive it: the session is refused all the same.
+    const there = await payload.db.count({ collection: opts.users, where: { id: { equals: relId(payload, opts.users, s.via) } } })
+    if (!there?.totalDocs) {
+      await revokeSessions(payload, { sid: { equals: sid } }, 'account deleted')
+      return null
+    }
     const link = await sharedLink(payload, String(user.id), String(s.via))
     if (!link || link !== String(s.link)) {
       await revokeSessions(payload, { sid: { equals: sid } }, 'no longer linked')

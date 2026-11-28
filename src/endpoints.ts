@@ -4,7 +4,7 @@ import { addSessionToUser, generateCookie } from 'payload/shared'
 import { blockedBy, exactlyTrue } from './access.js'
 import { cleanupSessions, revokeSessions, revokeSid, sessionBySid, sharedLink, tombstone, wornHat } from './sessions.js'
 import { memoryKey, needsStepUp, remembered } from './stepup.js'
-import { asPlugin, DISSOLVING, hashToken, hatsOptions, hatsStateOf, idOf, newToken, relId, tell, trackWork, unmarked, withMark } from './state.js'
+import { asPlugin, DISSOLVING, hashToken, hatsOptions, hatsStateOf, idOf, newToken, relId, removeWhere, tell, trackWork, unmarked, withMark } from './state.js'
 import { LINKS, MEMBERS, REQUESTS, SESSIONS, type Hat, type HatsEvent, type HatsUser, type ResolvedHatsOptions } from './types.js'
 
 const json = (body: unknown, status = 200, cookies: string[] = []) => {
@@ -40,7 +40,9 @@ async function members(req: PayloadRequest, link: string) {
 }
 async function membershipOf(req: PayloadRequest, userId: string) {
   const { docs } = await req.payload.find({ collection: MEMBERS as never, where: { user: { equals: userId } }, limit: 1, depth: 0, overrideAccess: true, pagination: false, req })
-  return (docs[0] as unknown as { id: string; link: unknown; user: unknown; status: string } | undefined) ?? null
+  const row = (docs[0] as unknown as { id: string; link: unknown; user: unknown; status: string } | undefined) ?? null
+  // Only a row for exactly this account: on MongoDB the text "null" can match a row whose account was cleared.
+  return row && row.user != null && idOf(row.user) === userId ? row : null
 }
 
 /** The other approved accounts in the acting account's set, with their hats. */
@@ -185,6 +187,8 @@ async function switchCore(req: PayloadRequest, body: SwitchInput): Promise<Switc
   await blockedReason(req, opts)
   const current = String(full.id)
   const to = body.account == null || body.account === '' ? current : String(body.account)
+  // Only an id exactly as the account has it. Anything else answers as an account that isn't linked, before any query.
+  if (to !== current && !exactId(req, opts, body.account)) refuse('That account isn’t linked to this one.', 403, 'notLinked')
 
   let link: string | null = null
   if (to !== current) {
@@ -331,8 +335,12 @@ const requestLink: Endpoint = {
 
     await asPlugin(req, async () => {
       // Requests nobody confirmed in time don't hold anyone up.
-      await req.payload.delete({ collection: MEMBERS as never, where: { and: [{ status: { equals: 'requested' } }, { tokenExpires: { less_than: now.toISOString() } }] }, overrideAccess: true, showHiddenFields: true, req })
-      await req.payload.delete({ collection: REQUESTS as never, where: { expiresAt: { less_than: now.toISOString() } }, overrideAccess: true, req })
+      // Best effort: what isn't removed now goes on a later request, and the request goes on either way.
+      for (const swept of [
+        await req.payload.delete({ collection: MEMBERS as never, where: { and: [{ status: { equals: 'requested' } }, { tokenExpires: { less_than: now.toISOString() } }] }, overrideAccess: true, showHiddenFields: true, req }),
+        await req.payload.delete({ collection: REQUESTS as never, where: { expiresAt: { less_than: now.toISOString() } }, overrideAccess: true, req }),
+      ])
+        if ((swept as { errors?: unknown[] }).errors?.length) req.payload.logger.warn({ msg: 'Hats: some expired link requests were not removed; a later request retries' })
     })
     const mine = await membershipOf(req, me)
     const already = mine ? (await members(req, idOf(mine.link))).length : 0
@@ -535,8 +543,8 @@ const confirm: Endpoint = {
       req.payload.logger.warn({ err: error }, 'Hats: link confirmation not recorded')
       await withMark(req, DISSOLVING, () =>
         asPlugin(req, async () => {
-          for (const id of made.rows) await req.payload.delete({ collection: MEMBERS as never, where: { id: { equals: id } }, overrideAccess: true, req })
-          if (made.link) await req.payload.delete({ collection: LINKS as never, where: { id: { equals: made.link } }, overrideAccess: true, req })
+          for (const id of made.rows) await removeWhere(req.payload, { collection: MEMBERS as never, where: { id: { equals: id } }, overrideAccess: true, req })
+          if (made.link) await removeWhere(req.payload, { collection: LINKS as never, where: { id: { equals: made.link } }, overrideAccess: true, req })
         }),
       ).catch((err) => req.payload.logger.warn({ err }, 'Hats: link confirmation clean-up skipped'))
       return bad()

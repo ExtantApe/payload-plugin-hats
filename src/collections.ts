@@ -2,7 +2,7 @@ import { APIError, validations, type CollectionConfig, type PayloadRequest, type
 
 import { exactlyTrue } from './access.js'
 import { dissolveIfAlone, revokeSessions } from './sessions.js'
-import { hatsStateOf, idOf, isDissolving, isInternal, tell } from './state.js'
+import { hatsStateOf, idOf, isDissolving, isInternal, ownHook, tell } from './state.js'
 import { LINKS, MEMBERS, REQUESTS, SESSIONS, type HatsUser, type ResolvedHatsOptions } from './types.js'
 
 const internal = isInternal
@@ -13,6 +13,14 @@ const internal = isInternal
  * rows straight after, in the account's afterDelete.
  */
 const requiredOnWrite: Validate = (value, options) => validations.relationship(value as never, { ...(options as object), required: true } as never)
+
+/**
+ * An account relationship every row must have. On MongoDB it stays `required`, as in 0.4.0, so its indexes come out
+ * exactly as 0.4.0 built them (Payload makes a unique index sparse when the field isn't required, and a database that
+ * already has the 0.4.0 index then refuses to start with `ensureIndexes`). MongoDB has no foreign keys, so nothing
+ * there needs the column to take null. On SQL databases the column is nullable and the rule moves to validation.
+ */
+const requiredAccount = (sql: boolean) => (sql ? { validate: requiredOnWrite } : { required: true as const })
 
 /**
  * Whether the request's user may approve links. A person never approves their own link: an approver who is (or
@@ -26,7 +34,7 @@ async function approver(opts: ResolvedHatsOptions, req: PayloadRequest) {
   return exactlyTrue(() => ask({ req, user }))
 }
 
-export function hatCollections(opts: ResolvedHatsOptions): CollectionConfig[] {
+export function hatCollections(opts: ResolvedHatsOptions, sql: boolean): CollectionConfig[] {
   const canApprove = ({ req }: { req: PayloadRequest }) => approver(opts, req)
   const never = () => false
 
@@ -54,7 +62,7 @@ export function hatCollections(opts: ResolvedHatsOptions): CollectionConfig[] {
     access: { read: canApprove, create: never, update: canApprove, delete: canApprove },
     fields: [
       { name: 'link', type: 'relationship', relationTo: LINKS, required: true, index: true, label: 'Linked set', admin: { readOnly: true, description: 'Filter the list by this set to see every account in it.' } },
-      { name: 'user', type: 'relationship', relationTo: opts.users as never, validate: requiredOnWrite, unique: true, admin: { readOnly: true } },
+      { name: 'user', type: 'relationship', relationTo: opts.users as never, ...requiredAccount(sql), unique: true, admin: { readOnly: true } },
       {
         name: 'status',
         type: 'select',
@@ -75,7 +83,7 @@ export function hatCollections(opts: ResolvedHatsOptions): CollectionConfig[] {
     ],
     hooks: {
       beforeChange: [
-        async ({ data, originalDoc, operation, req }) => {
+        ownHook(async ({ data, originalDoc, operation, req }) => {
           if (internal(req)) return data
           // Outside the plugin's own endpoints, the only change allowed is an approver approving a confirmed account.
           if (operation !== 'update' || !originalDoc) throw new APIError('Links are requested from the account page.', 403, undefined, true)
@@ -105,22 +113,22 @@ export function hatCollections(opts: ResolvedHatsOptions): CollectionConfig[] {
           })
           if (approved.totalDocs + 1 > opts.maxLinked) throw new APIError(`A set can hold at most ${opts.maxLinked} accounts.`, 400, undefined, true)
           return { ...data, approvedBy: me.id, approvedAt: new Date().toISOString() }
-        },
+        }),
       ],
       afterChange: [
-        async ({ doc, previousDoc, operation, req }) => {
+        ownHook(async ({ doc, previousDoc, operation, req }) => {
           if (operation === 'update' && previousDoc?.status !== 'approved' && doc.status === 'approved' && !internal(req))
             await opts.onEvent?.({ type: 'link-approved', req, link: idOf(doc.link), account: idOf(doc.user), by: String((req.user as HatsUser).id) })
-        },
+        }),
       ],
       afterDelete: [
-        async ({ doc, req }) => {
+        ownHook(async ({ doc, req }) => {
           const link = idOf(doc.link)
           const account = idOf(doc.user)
           await revokeSessions(req.payload, { and: [{ link: { equals: link } }, { or: [{ user: { equals: account } }, { via: { equals: account } }] }] }, 'unlinked', req)
           if (!internal(req)) await tell(req.payload, req, { type: 'unlinked', payload: req.payload, link, account, by: req.user ? String((req.user as HatsUser).id) : null })
           if (!isDissolving(req)) await dissolveIfAlone(req.payload, link, req)
-        },
+        }),
       ],
     },
   }
@@ -152,7 +160,7 @@ export function hatCollections(opts: ResolvedHatsOptions): CollectionConfig[] {
     admin: { hidden: true },
     access: { read: never, create: never, update: never, delete: never },
     fields: [
-      { name: 'requestedBy', type: 'relationship', relationTo: opts.users as never, validate: requiredOnWrite, index: true },
+      { name: 'requestedBy', type: 'relationship', relationTo: opts.users as never, ...requiredAccount(sql), index: true },
       { name: 'account', type: 'relationship', relationTo: opts.users as never, index: true },
       // Unique, so the database keeps it to one open invitation per account even when requests arrive together:
       // `account:<id>` while an invitation is open, otherwise a random `none:` value that holds nothing.
@@ -164,11 +172,11 @@ export function hatCollections(opts: ResolvedHatsOptions): CollectionConfig[] {
     ],
     hooks: {
       beforeChange: [
-        ({ data, req }) => {
+        ownHook(({ data, req }) => {
           // Server code with overrideAccess included: a request written outside the plugin could be confirmed.
           if (!internal(req)) throw new APIError('Only the hats plugin writes link requests.', 403, undefined, true)
           return data
-        },
+        }),
       ],
     },
   }

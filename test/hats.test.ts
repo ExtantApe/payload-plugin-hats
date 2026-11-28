@@ -4,7 +4,7 @@ import { buildConfig, createLocalReq, createPayloadRequest, getPayload, type San
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 
 import { applyHat, cleanupSessions, hats, hatsStateOf, MEMBERS, REQUESTS, SESSIONS, switchSession, type Hat, type HatsEvent, type HatsUser } from '../src/index.js'
-import { asPlugin, hashToken, isInternal, linkWorkSettled } from '../src/state.js'
+import { asPlugin, hashToken, isDissolving, isInternal, linkWorkSettled, unmarked, withMark, DISSOLVING } from '../src/state.js'
 import type { ResolvedHatsOptions } from '../src/types.js'
 
 /**
@@ -1890,5 +1890,84 @@ describe('link requests after review', () => {
     for (const context of [{ hatsInternal: true }, { hatsInternal: true, hatsDissolving: true }])
       await expect(payload.create({ collection: REQUESTS as never, data: data as never, overrideAccess: true, context })).rejects.toThrow(/Only the hats plugin/)
     expect(await requestsTo(target)).toBe(0)
+  })
+})
+
+describe('the plugin’s marks and the site’s callbacks', () => {
+  it('leaves no mark behind when the site’s callback runs the plugin’s own code inside it', async () => {
+    const req = await createLocalReq({}, payload)
+    const inside: boolean[] = []
+    await asPlugin(req, () =>
+      unmarked(req, async () => {
+        inside.push(isInternal(req))
+        await asPlugin(req, async () => void inside.push(isInternal(req)))
+        inside.push(isInternal(req))
+      }),
+    )
+    expect(inside).toEqual([false, true, false])
+    expect(isInternal(req)).toBe(false)
+    await withMark(req, DISSOLVING, () => unmarked(req, () => withMark(req, DISSOLVING, async () => 1)))
+    expect(isDissolving(req)).toBe(false)
+  })
+
+  it('keeps a mark off a site callback still running after the plugin moves on, and off the plugin after it', async () => {
+    const req = await createLocalReq({}, payload)
+    let release!: () => void
+    const held = new Promise<void>((r) => (release = r))
+    const late: boolean[] = []
+    let callback!: Promise<void>
+    await asPlugin(req, async () => {
+      callback = unmarked(req, async () => {
+        await held
+        late.push(isInternal(req))
+      })
+    })
+    await asPlugin(req, async () => {
+      release()
+      await callback
+    })
+    expect(late).toEqual([false])
+    expect(isInternal(req)).toBe(false)
+  })
+})
+
+describe('unlinking takes only an exact account id', () => {
+  /** Links two new accounts, approving only their own rows (earlier tests may leave other confirmed rows behind). */
+  async function pair() {
+    const approver = await make(email('maint'), 'admin', { maintainer: true })
+    const a = await make(email('a'), 'member')
+    const b = await make(email('b'), 'member')
+    mail.length = 0
+    expect((await call('/hats/link', await login(a.email!), { email: b.email })).status).toBe(202)
+    await confirmAll()
+    const { docs } = await payload.find({ collection: MEMBERS as never, where: { user: { in: [a.id, b.id] } }, depth: 0, overrideAccess: true })
+    for (const d of docs) await payload.update({ collection: MEMBERS as never, id: d.id, data: { status: 'approved' } as never, user: approver as never, overrideAccess: false })
+    return { a, b }
+  }
+
+  it('refuses any other spelling of the id with notInSet and no database text, and unlinks with the exact one', async () => {
+    const { a, b } = await pair()
+    const token = await login(a.email!)
+    const id = String(b.id)
+    const unlinked: HatsEvent[] = []
+    answers.event = (e) => void (e.type === 'unlinked' && unlinked.push(e))
+    for (const odd of [`0${id}`, `${id}abc`, ` ${id}`, `${id} `, `${id}e0`, `${id}.0`, { id: b.id }, [b.id], '', '99999999999999999999999', true]) {
+      const res = await call('/hats/unlink', token, { account: odd })
+      expect([JSON.stringify(odd), res.status, res.body?.data?.reason ?? res.body?.reason]).toEqual([JSON.stringify(odd), 404, 'notInSet'])
+      expect(JSON.stringify(res.body)).not.toMatch(/sql|select|where|syntax|cast/i)
+    }
+    expect(unlinked).toEqual([])
+    expect((await payload.count({ collection: MEMBERS as never, where: { user: { equals: b.id } }, overrideAccess: true })).totalDocs).toBe(1)
+    expect((await call('/hats/unlink', token, { account: b.id })).status).toBe(200)
+    expect(unlinked.map((e) => (e as { account: string }).account)).toEqual([id])
+  })
+
+  it('still unlinks, with no error, when the site’s unlinked handler throws', async () => {
+    const { a, b } = await pair()
+    answers.event = (e) => {
+      if (e.type === 'unlinked') throw new Error('the site’s handler is down')
+    }
+    expect((await call('/hats/unlink', await login(a.email!), { account: String(b.id) })).status).toBe(200)
+    expect((await payload.count({ collection: MEMBERS as never, where: { user: { in: [a.id, b.id] } }, overrideAccess: true })).totalDocs).toBe(0)
   })
 })

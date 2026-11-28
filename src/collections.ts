@@ -1,11 +1,18 @@
-import { APIError, type CollectionConfig, type PayloadRequest } from 'payload'
+import { APIError, validations, type CollectionConfig, type PayloadRequest, type Validate } from 'payload'
 
 import { exactlyTrue } from './access.js'
 import { dissolveIfAlone, revokeSessions } from './sessions.js'
-import { hatsStateOf, idOf, isDissolving, isInternal } from './state.js'
+import { hatsStateOf, idOf, isDissolving, isInternal, tell } from './state.js'
 import { LINKS, MEMBERS, REQUESTS, SESSIONS, type HatsUser, type ResolvedHatsOptions } from './types.js'
 
 const internal = isInternal
+
+/**
+ * Required on every write, but nullable in the database. On SQL databases the account's foreign key sets these to
+ * null as the account is deleted; a NOT NULL column would refuse that, so the delete failed. The plugin removes those
+ * rows straight after, in the account's afterDelete.
+ */
+const requiredOnWrite: Validate = (value, options) => validations.relationship(value as never, { ...(options as object), required: true } as never)
 
 /**
  * Whether the request's user may approve links. A person never approves their own link: an approver who is (or
@@ -47,7 +54,7 @@ export function hatCollections(opts: ResolvedHatsOptions): CollectionConfig[] {
     access: { read: canApprove, create: never, update: canApprove, delete: canApprove },
     fields: [
       { name: 'link', type: 'relationship', relationTo: LINKS, required: true, index: true, label: 'Linked set', admin: { readOnly: true, description: 'Filter the list by this set to see every account in it.' } },
-      { name: 'user', type: 'relationship', relationTo: opts.users as never, required: true, unique: true, admin: { readOnly: true } },
+      { name: 'user', type: 'relationship', relationTo: opts.users as never, validate: requiredOnWrite, unique: true, admin: { readOnly: true } },
       {
         name: 'status',
         type: 'select',
@@ -111,7 +118,7 @@ export function hatCollections(opts: ResolvedHatsOptions): CollectionConfig[] {
           const link = idOf(doc.link)
           const account = idOf(doc.user)
           await revokeSessions(req.payload, { and: [{ link: { equals: link } }, { or: [{ user: { equals: account } }, { via: { equals: account } }] }] }, 'unlinked', req)
-          if (!internal(req)) await opts.onEvent?.({ type: 'unlinked', payload: req.payload, link, account, by: req.user ? String((req.user as HatsUser).id) : null })
+          if (!internal(req)) await tell(req.payload, req, { type: 'unlinked', payload: req.payload, link, account, by: req.user ? String((req.user as HatsUser).id) : null })
           if (!isDissolving(req)) await dissolveIfAlone(req.payload, link, req)
         },
       ],
@@ -145,7 +152,7 @@ export function hatCollections(opts: ResolvedHatsOptions): CollectionConfig[] {
     admin: { hidden: true },
     access: { read: never, create: never, update: never, delete: never },
     fields: [
-      { name: 'requestedBy', type: 'relationship', relationTo: opts.users as never, required: true, index: true },
+      { name: 'requestedBy', type: 'relationship', relationTo: opts.users as never, validate: requiredOnWrite, index: true },
       { name: 'account', type: 'relationship', relationTo: opts.users as never, index: true },
       // Unique, so the database keeps it to one open invitation per account even when requests arrive together:
       // `account:<id>` while an invitation is open, otherwise a random `none:` value that holds nothing.

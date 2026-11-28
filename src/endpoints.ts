@@ -4,7 +4,7 @@ import { addSessionToUser, generateCookie } from 'payload/shared'
 import { blockedBy, exactlyTrue } from './access.js'
 import { cleanupSessions, revokeSessions, revokeSid, sessionBySid, sharedLink, tombstone, wornHat } from './sessions.js'
 import { memoryKey, needsStepUp, remembered } from './stepup.js'
-import { asPlugin, DISSOLVING, hashToken, hatsOptions, hatsStateOf, idOf, newToken, relId, trackWork, unmarked, withMark } from './state.js'
+import { asPlugin, DISSOLVING, hashToken, hatsOptions, hatsStateOf, idOf, newToken, relId, tell, trackWork, unmarked, withMark } from './state.js'
 import { LINKS, MEMBERS, REQUESTS, SESSIONS, type Hat, type HatsEvent, type HatsUser, type ResolvedHatsOptions } from './types.js'
 
 const json = (body: unknown, status = 200, cookies: string[] = []) => {
@@ -40,7 +40,7 @@ async function members(req: PayloadRequest, link: string) {
 }
 async function membershipOf(req: PayloadRequest, userId: string) {
   const { docs } = await req.payload.find({ collection: MEMBERS as never, where: { user: { equals: userId } }, limit: 1, depth: 0, overrideAccess: true, pagination: false, req })
-  return (docs[0] as unknown as { id: string; link: unknown; status: string } | undefined) ?? null
+  return (docs[0] as unknown as { id: string; link: unknown; user: unknown; status: string } | undefined) ?? null
 }
 
 /** The other approved accounts in the acting account's set, with their hats. */
@@ -310,43 +310,6 @@ const pendingCap = (opts: ResolvedHatsOptions) => opts.maxLinked * 2
 /** What a request's unique `holds` is: the account invited, or a value of its own that holds nothing. */
 const holdFor = (account: HatsUser | null) => (account ? `account:${String(account.id)}` : `none:${newToken()}`)
 
-/**
- * Tells the site about a link event once the records are in. A handler that throws is logged by its error's name
- * only (a message can carry what the event was about) and skipped, so the person confirming still gets their page.
- */
-async function tell(req: PayloadRequest, opts: ResolvedHatsOptions, event: HatsEvent) {
-  if (!opts.onEvent) return
-  let timer: ReturnType<typeof setTimeout> | undefined
-  const late = new Promise<'late'>((resolve) => {
-    timer = setTimeout(() => resolve('late'), TELL_MS)
-  })
-  const run = unmarked(req, () => opts.onEvent!(event)).then(
-    () => 'ok' as const,
-    (error: unknown) => {
-      req.payload.logger.error({ msg: `Hats: an onEvent handler failed on ${event.type} (${safeName(error)})` })
-      return 'failed' as const
-    },
-  )
-  try {
-    if ((await Promise.race([run, late])) === 'late') req.payload.logger.warn({ msg: `Hats: an onEvent handler on ${event.type} is still running; the page didn't wait for it` })
-  } finally {
-    clearTimeout(timer)
-  }
-}
-
-/** The longest a link request or confirmation waits for the site's `onEvent` handler; it carries on unwaited after. */
-const TELL_MS = 2000
-
-/** An error's name for the log, only when it's a short plain word; anything else, or a name that throws, is `Error`. */
-function safeName(error: unknown): string {
-  try {
-    const name = (error as { name?: unknown } | null | undefined)?.name
-    return typeof name === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,39}$/.test(name) ? name : typeof error === 'object' && error ? 'Error' : typeof error
-  } catch {
-    return 'Error'
-  }
-}
-
 const requestLink: Endpoint = {
   path: '/hats/link',
   method: 'post',
@@ -435,7 +398,7 @@ const requestLink: Endpoint = {
         return
       }
       // With no set yet, the event waits for confirmation, when the set exists, so `link` is always a real set.
-      if (mine) await tell(req, opts, { type: 'link-requested', req, link: idOf(mine.link), by: me, account: String(target.id) })
+      if (mine) await tell(req.payload, req, { type: 'link-requested', req, link: idOf(mine.link), by: me, account: String(target.id) })
     }
     let finished = false
     const done = work()
@@ -497,7 +460,7 @@ const confirm: Endpoint = {
       await asPlugin(req, () =>
         req.payload.update({ collection: MEMBERS as never, id: m.id, data: { status: 'confirmed', confirmedAt: new Date().toISOString(), tokenHash: null, tokenExpires: null } as never, overrideAccess: true, req }),
       )
-      await tell(req, opts, { type: 'link-confirmed', payload: req.payload, link: idOf(m.link), account: idOf(m.user) })
+      await tell(req.payload, req, { type: 'link-confirmed', payload: req.payload, link: idOf(m.link), account: idOf(m.user) })
       return thanks()
     }
 
@@ -579,10 +542,19 @@ const confirm: Endpoint = {
       return bad()
     }
     // The records are written by now, so a handler that fails can't undo or block them: it's logged and skipped.
-    if (made.link) await tell(req, opts, { type: 'link-requested', req, link: made.link, by, account })
-    await tell(req, opts, { type: 'link-confirmed', payload: req.payload, link: existing ?? made.link!, account })
+    if (made.link) await tell(req.payload, req, { type: 'link-requested', req, link: made.link, by, account })
+    await tell(req.payload, req, { type: 'link-confirmed', payload: req.payload, link: existing ?? made.link!, account })
     return thanks()
   },
+}
+
+/** Whether `v` is an account id written the one way the users collection writes its ids. */
+function exactId(req: PayloadRequest, opts: ResolvedHatsOptions, v: unknown): boolean {
+  if (typeof v !== 'string' && typeof v !== 'number') return false
+  const s = String(v)
+  const type = (req.payload.collections as Record<string, { customIDType?: string } | undefined>)[opts.users]?.customIDType ?? req.payload.db.defaultIDType
+  if (type === 'number') return /^(0|-?[1-9]\d{0,15})$/.test(s) && Number.isSafeInteger(Number(s))
+  return typeof v === 'string' && s.length > 0 && s.length <= 256 && s.trim() === s
 }
 
 /** POST /api/hats/unlink { account? }: take an account (default: the acting one) out of the set. Self-serve, at once. */
@@ -594,14 +566,19 @@ const unlink: Endpoint = {
     const { opts, full, person } = await actor(req)
     await blockedReason(req, opts)
     const me = String(full.id)
-    const account = String((req.data as { account?: unknown } | undefined)?.account ?? me)
+    const asked = (req.data as { account?: unknown } | undefined)?.account ?? me
+    const notInSet = () => refuse('That account isn’t in your linked set.', 404, 'notInSet')
+    // Only an id exactly as the account has it: no other spelling of a number, and nothing the database would have to
+    // make sense of first.
+    if (!exactId(req, opts, asked)) notInSet()
+    const account = String(asked)
     const mine = await membershipOf(req, me)
     const theirs = account === me ? mine : await membershipOf(req, account)
     // Another account still waiting to confirm is hidden from the set, so it answers as if it weren't there.
-    if (!mine || !theirs || idOf(mine.link) !== idOf(theirs.link) || (account !== me && theirs.status === 'requested')) refuse('That account isn’t in your linked set.', 404, 'notInSet')
+    if (!mine || !theirs || idOf(theirs.user) !== account || idOf(mine.link) !== idOf(theirs.link) || (account !== me && theirs.status === 'requested')) notInSet()
     const link = idOf(theirs!.link)
     await asPlugin(req, () => req.payload.delete({ collection: MEMBERS as never, id: theirs!.id, overrideAccess: true, req }))
-    await opts.onEvent?.({ type: 'unlinked', payload: req.payload, link, account, by: me })
+    await tell(req.payload, req, { type: 'unlinked', payload: req.payload, link, account, by: me })
     // If this session was switched in through the account just removed, it ended with the unlink.
     return json({ ok: true, signedOut: account === me ? person !== me : person === account })
   },

@@ -2,10 +2,17 @@
 
 Newest first.
 
+## 2026-11-27 (review round four): deletes that fail or happen, handlers, marks, exact ids
+
+- New promises: a delete that doesn't happen changes no link records; a delete that happens leaves nothing pointing at a missing account or set, in bulk too; no event handler can block or undo an account delete; a site callback never leaves the plugin's mark on; unlink takes only an exact id.
+- Covered: `test/delete.test.ts` (10 cases, run on MongoDB with and without transactions, and on SQLite by hand): refused by another plugin, with `disableTransaction`, by access; bulk with one refused; bulk two of three and all three in one set; throwing and never-finishing `sessions-revoked` handler on a child's account; the site's afterDelete throwing; a plain single delete. An invariant check walks every row for references to missing accounts or sets. In `test/hats.test.ts`: two mark tests, exact-id unlink, a throwing `unlinked` handler. `test/numeric-ids.test.ts` now spies on what the plugin passes to Payload. On the previous commit all four new main-suite tests fail, and 17 of the 20 delete runs; the three refusal runs that pass there stay as regression guards.
+- Corrected: the round-three line said the numeric-ids file proved the id type through Payload's relationship checks on MongoDB. It didn't: MongoDB accepts a string there, so it passed on the old code. The spy now fails on the commit before the fix.
+- Gaps skipped: a database failure in the middle of the clean-up (documented limit, needs fault injection in the adapter); Postgres; an approver's bulk delete of member rows (unchanged path, not part of this review).
+
 ## 2026-11-27 (review round three): number ids, SQL deletes, handler bounds, the mark on callbacks
 
 - New promises: relationships hold the account's own id type; deleting an account works on SQL; a link event handler can't hang or 500 the confirm page; host callbacks never see the plugin's mark.
-- Covered: `test/numeric-ids.test.ts` (number-id users on in-memory MongoDB: request, both confirmations, the set and an account delete, plus `relId`); in `test/hats.test.ts`, "a handler’s error has a name that throws", "handlers never finish", "without the plugin’s mark". The whole main suite also ran once by hand on SQLite (`HATS_DB=sqlite`), 79 passing, the MongoDB write-count test skipped.
+- Covered: `test/numeric-ids.test.ts` (number-id users on in-memory MongoDB: request, both confirmations, the set and an account delete, plus `relId`; it only proved the id type once round four added the spy); in `test/hats.test.ts`, "a handler’s error has a name that throws", "handlers never finish", "without the plugin’s mark". The whole main suite also ran once by hand on SQLite (`HATS_DB=sqlite`), 79 passing, the MongoDB write-count test skipped.
 - Fixed: the flaky timing test now waits for the request's background work (`linkWorkSettled`), no longer a sleep.
 - Gaps skipped: Postgres and `payload migrate:create` (no server here; SQLite covers the id type and foreign keys); a startup check for the `holds` index with `autoIndex` off and calls inside a caller's transaction (documented limits, no code to test); a stranger holding an invitation (unchanged behavior, documented).
 

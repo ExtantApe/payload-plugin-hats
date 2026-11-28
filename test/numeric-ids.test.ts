@@ -7,9 +7,11 @@ import { hats, LINKS, MEMBERS, REQUESTS, type HatsUser } from '../src/index.js'
 import { linkWorkSettled, relId } from '../src/state.js'
 
 /**
- * Accounts with number ids, as SQL databases give them by default. Here a made-up users collection with a custom
- * number id on in-memory MongoDB stands in, so the suite needs no SQL adapter: the relationship checks are Payload's
- * own and refuse a string where a number belongs, exactly as they do on SQLite and Postgres.
+ * Accounts with number ids, as SQL databases give them by default. A made-up users collection with a custom number id
+ * on in-memory MongoDB stands in, so the suite needs no SQL adapter. MongoDB itself would accept a string id in a
+ * relationship, so the checks here watch what the plugin hands Payload: every account id it writes into a
+ * relationship must already be a number. (SQLite and Postgres refuse a string there; `HATS_DB=sqlite` runs the main
+ * suite on SQLite.)
  */
 let payload: Payload
 let mongo: MongoMemoryReplSet
@@ -39,6 +41,20 @@ beforeAll(async () => {
   })
   payload = await getPayload({ config })
 }, 120_000)
+
+/** Every account-id value the plugin passes to Payload in a create or update of its own collections. */
+const written: { collection: string; field: string; value: unknown }[] = []
+const ACCOUNT_FIELDS = ['user', 'requestedBy', 'account', 'addedBy', 'approvedBy']
+beforeAll(() => {
+  for (const op of ['create', 'update'] as const) {
+    const real = payload[op].bind(payload) as (args: { collection: string; data?: Record<string, unknown> }) => Promise<unknown>
+    ;(payload as unknown as Record<string, unknown>)[op] = (args: { collection: string; data?: Record<string, unknown> }) => {
+      if (args.collection !== 'users')
+        for (const field of ACCOUNT_FIELDS) if (args.data && field in args.data && args.data[field] != null) written.push({ collection: args.collection, field, value: args.data[field] })
+      return real(args)
+    }
+  }
+})
 
 afterAll(async () => {
   await payload?.destroy()
@@ -89,6 +105,9 @@ describe('accounts with number ids', () => {
     ])
     const sets = (await payload.find({ collection: LINKS as never, depth: 0, overrideAccess: true })).docs as unknown as { requestedBy: unknown }[]
     expect(sets.map((s) => s.requestedBy)).toEqual([asker.id])
+
+    expect(written.length).toBeGreaterThanOrEqual(5)
+    expect(written.filter((w) => typeof w.value !== 'number')).toEqual([])
 
     await payload.delete({ collection: 'users', id: asker.id, overrideAccess: true })
     expect((await payload.count({ collection: MEMBERS as never, where: { user: { equals: asker.id } }, overrideAccess: true })).totalDocs).toBe(0)

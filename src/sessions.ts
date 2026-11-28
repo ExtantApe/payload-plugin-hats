@@ -1,6 +1,6 @@
 import type { AuthStrategy, Payload, PayloadRequest, Where } from 'payload'
 
-import { asPlugin, attachState, DISSOLVING, hatsOptions, idOf, unmarked, withMark } from './state.js'
+import { asPlugin, attachState, DISSOLVING, hatsOptions, idOf, tell, withMark } from './state.js'
 import { LINKS, MEMBERS, SESSIONS, type Hat, type HatsState, type HatsUser, type ResolvedHatsOptions } from './types.js'
 
 type SessionDoc = { id: string; sid: string; user: string; via?: string | null; link?: string | null; hat?: string | null; steppedUp?: Record<string, string> | null; revokedAt?: string | null; expiresAt?: string | null }
@@ -38,8 +38,9 @@ export async function revokeSessions(payload: Payload, where: Where, reason: str
     await revokeSid(payload, s.user, s.sid, req)
     await tombstone(payload, s.id, req)
   }
-  // This can run inside the plugin's own writes (an unlink, a set dissolving), so the site's handler runs unmarked.
-  if (docs.length) await unmarked(req, () => hatsOptions(payload).onEvent?.({ type: 'sessions-revoked', payload, sessions: docs.length, reason }))
+  // This can run inside the plugin's own writes (an unlink, a set dissolving, an account deleted), so the site's
+  // handler runs unmarked, and one that fails or hangs can't block or undo them.
+  if (docs.length) await tell(payload, req, { type: 'sessions-revoked', payload, sessions: docs.length, reason })
   return docs.length
 }
 
@@ -49,7 +50,8 @@ export async function dissolveIfAlone(payload: Payload, link: string, req: Paylo
   if (docs.length > 1) return
   await withMark(req, DISSOLVING, () =>
     asPlugin(req, async () => {
-      for (const d of docs) await payload.delete({ collection: MEMBERS as never, id: d.id, overrideAccess: true, req })
+      // By id one at a time, and gone already is fine: an account's clean-up may have removed a row a moment ago.
+      for (const d of docs) await payload.delete({ collection: MEMBERS as never, where: { id: { equals: d.id } }, overrideAccess: true, req })
       await payload.delete({ collection: LINKS as never, where: { id: { equals: link } }, overrideAccess: true, req })
     }),
   )

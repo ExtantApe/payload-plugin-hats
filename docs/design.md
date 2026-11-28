@@ -32,8 +32,30 @@ hats({
 
 ## Data
 
-- **`hat-links`** collection: `members` (2–4 accounts), `status` (requested, confirmed, approved or unlinked), per-member `confirmations` (a hashed one-time token, its expiry, when confirmed), `requestedBy`, `approvedBy`/`approvedAt`, `unlinkedAt`/`unlinkedBy`. An account belongs to at most one approved set (checked on save). Access: members read their own set; only `canApproveLinks` approves; nothing else writes except the plugin's endpoints.
-- No fields added to users. Hats and step-up live in the session, so two browsers can wear different hats.
+Brought up to date with 0.5.0 on 2026-11-28.
+
+The plugin adds four collections. No fields are added to users. Hats and step-up live in the session, so two browsers can wear different hats.
+
+Below, a user who may approve is a signed-in account from the `users` collection for which `canApproveLinks` answers exactly `true`. Without that option, nobody may approve. With access checks on, no user can create rows in any of the four. Server code with `overrideAccess` can read all four and delete from all four.
+
+- **`hat-links`**: one row for each linked set.
+  - Fields: `label` (who started the set) and `requestedBy`.
+  - Users: only a user who may approve can read it. No user can create, update or delete it. It is hidden in the admin.
+  - Server code with `overrideAccess` can write it.
+- **`hat-members`**: one row for each account in a set. `user` is unique, so an account has at most one row and is in at most one set.
+  - Fields: `link` (the set), `user`, `status` (`requested`, `confirmed` or `approved`), `tokenHash` and `tokenExpires` (hidden, for a confirmation still waiting), `addedBy`, `confirmedAt`, `approvedBy` and `approvedAt`. `user` is required on every write. On SQL databases its column can be null.
+  - Users: only a user who may approve can read, update or delete it.
+  - Creates: the collection's own hook refuses a create from anything but the plugin, including from server code with `overrideAccess`. Rows come from the request, the confirmations and an approval. The plugin creates the invited account's row as `confirmed` when that account confirms. An asker with no set also gets a row then, which stays `requested` until they confirm from their own email. An asker already in a set doesn't confirm again.
+  - Updates: apart from the plugin's own writes, the hook lets an update through only from a user who may approve. This applies to server code too. That update can change nothing but the status, which must stay as it is or move from `confirmed` to `approved`. A move to `approved` needs a set the user doesn't belong to, as the acting account or the one they signed in with. The set must also have room under `maxLinked` (default 4). On approval the hook fills in `approvedBy` and `approvedAt`.
+  - Deletes: a user who may approve and server code with `overrideAccess` can delete a row. An account in the set can also unlink through the plugin. Deleting a row unlinks the account and ends the switched sessions tied to it in that set. If one account or none is left, the set is removed. There is no `unlinked` status.
+- **`hat-sessions`**: the hat and switch state for a Payload session.
+  - Fields: `sid` (unique), `user`, `via` (the account that signed in), `link` (the set), `hat`, `steppedUp` (when a second factor was last given), `expiresAt` and `revokedAt`.
+  - Users: no user can read, create, update or delete it. It is hidden in the admin.
+  - Server code with `overrideAccess` can write it.
+- **`hat-requests`**: open link requests.
+  - Fields: `requestedBy`, `account` (set only for an invitation), `holds` (unique, so an account has one open invitation at a time), `tokenHash`, `expiresAt` and `link` (the asker's set when they asked). `requestedBy` is required on every write. On SQL databases its column can be null.
+  - Users: no user can read, create, update or delete it. It is hidden in the admin.
+  - Only the plugin can create or update a row. The collection's own hook refuses anyone else, including server code with `overrideAccess`. A key in `context` doesn't change that. Server code with `overrideAccess` can read and delete rows.
 
 ## Sessions
 

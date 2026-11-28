@@ -8,7 +8,7 @@ import { hats, LINKS, MEMBERS, REQUESTS, SESSIONS } from '../src/index.js'
 import { asPlugin } from '../src/state.js'
 
 /**
- * A MongoDB database left by 0.4.0, then this build started on it with `ensureIndexes: true`. 0.4.1 needs no host step
+ * A MongoDB database left by 0.4.0, then this build started on it with `ensureIndexes: true`. 0.5.0 needs no host step
  * on MongoDB, so the plugin's 0.4.0 collections must keep exactly the indexes 0.4.0 built (an index of the same name
  * with other options makes MongoDB refuse to start), and the new `hat-requests` collection gets its own.
  *
